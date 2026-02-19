@@ -90,8 +90,9 @@ z_prop = 120e-6
 z_input_to_first = 40e-6
 
 # wavelengths (MultiWL)
-wavelengths = np.array([1550e-9, 1568e-9, 1650e-9], dtype=np.float32)
-# wavelengths = np.array([650e-9, 1568e-9], dtype=np.float32)
+# wavelengths = np.array([1550e-9, 1568e-9, 1650e-9], dtype=np.float32)
+# wavelengths = np.array([1550e-9], dtype=np.float32)
+wavelengths = np.array([650e-9], dtype=np.float32)
 # wavelengths = np.array([650e-9, 1568e-9], dtype=np.float32)
 base_wavelength_idx = 0
 L = int(len(wavelengths))
@@ -102,12 +103,12 @@ label_pattern_mode = "circle"  # "circle" or "eigenmode"
 show_detection_overlap_debug = True
 
 # train hyperparams
-epochs = 400
+epochs = 1000
 lr = 1.99
 padding_ratio = 0.5
 
 # output root
-RUN_ROOT = Path("results/1550_1568_1650_spatial_label")
+RUN_ROOT = Path(f"results/650_1550_spatial_label_base{base_wavelength_idx}")
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 # prediction viz samples

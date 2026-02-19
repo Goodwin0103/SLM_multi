@@ -167,7 +167,7 @@ def generate_detector_patterns(h, w, N, shape="circle", visualize=False, save_pa
 
 def main():
     import os
-    from odnn_io import load_complex_modes_from_mat
+    from SLM.SLM_MULTIWL.odnn_io import load_complex_modes_from_mat
 
     current_path = os.getcwd()
     print("Current Working Directory:", current_path)
