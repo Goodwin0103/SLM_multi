@@ -13,7 +13,6 @@ venv/
 *.pth
 *.ckpt
 runs/
-results/
 wandb/
 logs/
 

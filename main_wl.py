@@ -64,7 +64,7 @@ print("Using Device:", device)
 # ============================================================
 field_size = 25
 layer_size = 110
-num_modes = 5
+num_modes = 3
 
 circle_focus_radius = 5
 circle_detectsize = 10  # 你原来当作“直径/窗口”，评估用半径 = detectsize//2
@@ -108,7 +108,7 @@ lr = 1.99
 padding_ratio = 0.5
 
 # output root
-RUN_ROOT = Path(f"results/650_1550_spatial_label_base{base_wavelength_idx}")
+RUN_ROOT = Path(f"results/650_spatial_label_base{base_wavelength_idx}")
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 # prediction viz samples
