@@ -1,0 +1,21 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.ipynb_checkpoints/
+.venv/
+venv/
+.env
+.DS_Store
+
+# PyTorch / training artifacts
+*.pt
+*.pth
+*.ckpt
+runs/
+results/
+wandb/
+logs/
+
+# MATLAB
+*.mat
