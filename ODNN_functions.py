@@ -4,6 +4,8 @@ import torch
 import torchvision
 from torchvision import transforms
 import h5py
+import math
+from typing import List, Tuple
 #%%
 def place_square_by_index(index, array_size=100, square_size=5, distance=15):
     """
@@ -518,6 +520,149 @@ def create_evaluation_regions(H, W, N, radius, detectsize):
     
     return evaluation_regions
 
+
+
+def create_evaluation_regions_multiwl(
+    H: int,
+    W: int,
+    num_detector: int,
+    focus_radius: int,
+    detectsize: int,
+    num_wavelengths: int,
+    *,
+    layout: str = "columns",     # "columns" or "rows"
+    margin: int = 2,             # 与边界/相邻ROI的额外安全间隔(px)
+) -> List[List[Tuple[int, int, int, int]]]:
+    """
+    多波长版本 create_evaluation_regions：为每个波长生成一套 evaluation_regions，
+    并在几何上将不同波长的ROI放到不重叠的“分区”里（默认按列分区）。
+
+    返回:
+      evaluation_regions_by_wl: 长度=num_wavelengths 的 list
+        evaluation_regions_by_wl[li] = [(x0,x1,y0,y1), ...]  # 长度=num_detector
+
+    说明:
+    - 每个ROI是边长=detectsize 的方框(尽量保持)，中心点按规则排布。
+    - focus_radius 参数保留以兼容你原接口（这里不参与计算；你若想用圆积分，依旧用 detectsize//2）。
+    """
+    if num_wavelengths < 1:
+        raise ValueError("num_wavelengths must be >= 1")
+    if num_detector < 1:
+        raise ValueError("num_detector must be >= 1")
+    if detectsize < 1:
+        raise ValueError("detectsize must be >= 1")
+
+    half = detectsize // 2
+    # ROI 最小可用空间要求
+    min_span = detectsize + 2 * margin
+
+    def centers_to_regions(centers):
+        regions = []
+        for (cx, cy) in centers:
+            x0 = cx - half
+            x1 = x0 + detectsize
+            y0 = cy - half
+            y1 = y0 + detectsize
+
+            # 裁剪到边界
+            x0 = max(0, min(W - 1, x0))
+            y0 = max(0, min(H - 1, y0))
+            x1 = max(1, min(W, x1))
+            y1 = max(1, min(H, y1))
+
+            # 若因裁剪导致尺寸不够，尽量向回补齐
+            if x1 - x0 < detectsize:
+                if x0 == 0:
+                    x1 = min(W, x0 + detectsize)
+                elif x1 == W:
+                    x0 = max(0, x1 - detectsize)
+            if y1 - y0 < detectsize:
+                if y0 == 0:
+                    y1 = min(H, y0 + detectsize)
+                elif y1 == H:
+                    y0 = max(0, y1 - detectsize)
+
+            regions.append((x0, x1, y0, y1))
+        return regions
+
+    evaluation_regions_by_wl: List[List[Tuple[int, int, int, int]]] = []
+
+    if layout == "columns":
+        block_w = W / num_wavelengths
+        if block_w < min_span:
+            raise ValueError(
+                f"Image too narrow to split into {num_wavelengths} non-overlapping column blocks. "
+                f"W={W}, block_w={block_w:.1f}, need >= {min_span}."
+            )
+
+        # 每个波长：在其列分区中，x 固定在分区中心；y 均匀排布
+        y_top = margin + half
+        y_bot = H - 1 - margin - half
+        if y_bot < y_top:
+            raise ValueError("Image too short for given detectsize/margin.")
+
+        for li in range(num_wavelengths):
+            x_left = int(math.floor(li * block_w))
+            x_right = int(math.floor((li + 1) * block_w)) - 1
+            x_left = max(0, x_left)
+            x_right = min(W - 1, x_right)
+
+            # 分区内 x 的可放置范围（保证ROI不越界且留margin）
+            cx_min = x_left + margin + half
+            cx_max = x_right - margin - half
+            if cx_max < cx_min:
+                raise ValueError(
+                    f"Block {li} too narrow for ROI: [{x_left},{x_right}] with detectsize={detectsize}, margin={margin}"
+                )
+            cx = (cx_min + cx_max) // 2
+
+            if num_detector == 1:
+                centers = [(cx, (y_top + y_bot) // 2)]
+            else:
+                ys = [int(round(y_top + t * (y_bot - y_top) / (num_detector - 1))) for t in range(num_detector)]
+                centers = [(cx, y) for y in ys]
+
+            evaluation_regions_by_wl.append(centers_to_regions(centers))
+
+    elif layout == "rows":
+        block_h = H / num_wavelengths
+        if block_h < min_span:
+            raise ValueError(
+                f"Image too short to split into {num_wavelengths} non-overlapping row blocks. "
+                f"H={H}, block_h={block_h:.1f}, need >= {min_span}."
+            )
+
+        x_left = margin + half
+        x_right = W - 1 - margin - half
+        if x_right < x_left:
+            raise ValueError("Image too narrow for given detectsize/margin.")
+
+        for li in range(num_wavelengths):
+            y_top_block = int(math.floor(li * block_h))
+            y_bot_block = int(math.floor((li + 1) * block_h)) - 1
+            y_top_block = max(0, y_top_block)
+            y_bot_block = min(H - 1, y_bot_block)
+
+            cy_min = y_top_block + margin + half
+            cy_max = y_bot_block - margin - half
+            if cy_max < cy_min:
+                raise ValueError(
+                    f"Block {li} too short for ROI: [{y_top_block},{y_bot_block}] with detectsize={detectsize}, margin={margin}"
+                )
+            cy = (cy_min + cy_max) // 2
+
+            if num_detector == 1:
+                centers = [((x_left + x_right) // 2, cy)]
+            else:
+                xs = [int(round(x_left + t * (x_right - x_left) / (num_detector - 1))) for t in range(num_detector)]
+                centers = [(x, cy) for x in xs]
+
+            evaluation_regions_by_wl.append(centers_to_regions(centers))
+
+    else:
+        raise ValueError("layout must be 'columns' or 'rows'")
+
+    return evaluation_regions_by_wl
 
 #%%
 # # create the labels of the dataset
@@ -1063,3 +1208,58 @@ def load_mmf_modes_hdf5(
             plt.close(fig)
 
     return torch.tensor(mmf_modes, dtype=torch.complex64)
+import numpy as np
+from typing import List, Tuple
+
+def regions_to_centers(regions: List[Tuple[int,int,int,int]]) -> List[Tuple[int,int]]:
+    centers = []
+    for (x0, x1, y0, y1) in regions:
+        cx = int(round((x0 + (x1 - 1)) / 2.0))
+        cy = int(round((y0 + (y1 - 1)) / 2.0))
+        centers.append((cx, cy))
+    return centers
+
+
+def create_circle_mask_at_center(H: int, W: int, cx: int, cy: int, radius: int) -> np.ndarray:
+    Y, X = np.ogrid[:H, :W]
+    dist = np.sqrt((X - cx) ** 2 + (Y - cy) ** 2)
+    return (dist <= radius).astype(np.float32)
+
+
+def build_patterns_from_regions_multiwl(
+    H: int,
+    W: int,
+    evaluation_regions_by_wl: List[List[Tuple[int,int,int,int]]],
+    radius: int,
+) -> List[np.ndarray]:
+    """
+    patterns_by_wl[li] shape=(H,W,M)
+    第k通道是在 evaluation_regions_by_wl[li][k] 的中心画圆
+    """
+    patterns_by_wl: List[np.ndarray] = []
+    for regions in evaluation_regions_by_wl:
+        centers = regions_to_centers(regions)  # len=M
+        masks = [create_circle_mask_at_center(H, W, cx, cy, radius) for (cx, cy) in centers]
+        patterns_by_wl.append(np.stack(masks, axis=2).astype(np.float32))  # (H,W,M)
+    return patterns_by_wl
+
+
+def build_spatial_labels_multiwl_from_amplitudes(
+    amplitudes: np.ndarray,          # (N,M)
+    patterns_by_wl: List[np.ndarray] # L * (H,W,M)
+) -> np.ndarray:
+    """
+    label[n,li,:,:] = Σ_k amp[n,k]^2 * patterns_by_wl[li][:,:,k]
+    return (N,L,H,W) float32
+    """
+    amp = np.asarray(amplitudes, dtype=np.float32)
+    energy = amp ** 2
+
+    L = len(patterns_by_wl)
+    H, W, M = patterns_by_wl[0].shape
+
+    labels = np.zeros((amp.shape[0], L, H, W), dtype=np.float32)
+    for li in range(L):
+        P = patterns_by_wl[li]  # (H,W,M)
+        labels[:, li] = np.tensordot(energy, np.transpose(P, (2, 0, 1)), axes=([1], [0]))
+    return labels

@@ -164,10 +164,68 @@ def generate_detector_patterns(h, w, N, shape="circle", visualize=False, save_pa
 
     return patterns
 
+def generate_detector_patterns_multiwl(
+    H: int,
+    W: int,
+    num_modes: int,
+    num_wavelengths: int,
+    radius: int,
+    pattern_mode: str = "circle",
+    show_debug: bool = False
+) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
+    """
+    生成多波长标签图案
+    
+    Returns:
+        patterns: (H, W, num_modes * num_wavelengths) 每个通道对应一个 (模式, 波长) 组合
+        evaluation_regions: 每个标签的边界框 [(x0, x1, y0, y1), ...]
+    """
+    total_labels = num_modes * num_wavelengths
+    
+    # 计算布局 (例如 3×2=6 个标签排成 2 行 3 列)
+    num_rows = int(np.floor(np.sqrt(total_labels)))
+    num_cols = int(np.ceil(total_labels / num_rows))
+    
+    # 计算中心坐标
+    centers, row_spacing, col_spacing = compute_label_centers(H, W, total_labels, radius)
+    
+    # 生成图案
+    if pattern_mode == "circle":
+        patterns = np.zeros((H, W, total_labels), dtype=np.float32)
+        for idx, (cy, cx) in enumerate(centers):
+            yy, xx = np.ogrid[:H, :W]
+            mask = (yy - cy)**2 + (xx - cx)**2 <= radius**2
+            patterns[:, :, idx] = mask.astype(np.float32)
+    else:
+        raise NotImplementedError(f"Unsupported pattern_mode: {pattern_mode}")
+    
+    # 生成评估区域
+    evaluation_regions = []
+    for cy, cx in centers:
+        x0 = max(0, cx - radius)
+        x1 = min(W, cx + radius)
+        y0 = max(0, cy - radius)
+        y1 = min(H, cy + radius)
+        evaluation_regions.append((x0, x1, y0, y1))
+    
+    if show_debug:
+        # 可视化标签布局
+        fig, ax = plt.subplots(figsize=(8, 8))
+        ax.imshow(patterns.sum(axis=2), cmap='gray')
+        for idx, (cy, cx) in enumerate(centers):
+            mode_idx = idx // num_wavelengths
+            wl_idx = idx % num_wavelengths
+            ax.text(cx, cy, f"M{mode_idx}W{wl_idx}", 
+                   ha='center', va='center', color='red', fontsize=8)
+        plt.title(f"MultiWL Labels: {num_modes} modes × {num_wavelengths} wavelengths")
+        plt.savefig("debug_multiwl_labels.png", dpi=150)
+        plt.close()
+    
+    return patterns, evaluation_regions
 
 def main():
     import os
-    from SLM.SLM_MULTIWL.odnn_io import load_complex_modes_from_mat
+    from odnn_io import load_complex_modes_from_mat
 
     current_path = os.getcwd()
     print("Current Working Directory:", current_path)
