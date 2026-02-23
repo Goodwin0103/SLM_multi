@@ -174,6 +174,75 @@ def spot_energy_ratios_circle(
     ratios = energies / total
     return energies, ratios
 
+import torch
+
+
+@torch.no_grad()
+def _make_circle_mask(h: int, w: int, r: float, device: torch.device) -> torch.Tensor:
+    yy, xx = torch.meshgrid(
+        torch.arange(h, device=device),
+        torch.arange(w, device=device),
+        indexing="ij",
+    )
+    cy = (h - 1) / 2.0
+    cx = (w - 1) / 2.0
+    return (((yy - cy) ** 2 + (xx - cx) ** 2) <= (r ** 2)).to(torch.float32)
+
+
+@torch.no_grad()
+def region_energies_circle(
+    I_bhw: torch.Tensor,  # (B, H, W) float
+    evaluation_regions: list[tuple[int, int, int, int]],
+    detect_radius: int,
+) -> torch.Tensor:
+    """
+    返回每个 ROI 的“绝对能量”(不归一化): (B, M)
+    ROI 内用圆形 mask 积分（与你现有 detect_radius 口径一致）。
+    """
+    B, H, W = I_bhw.shape
+    M = len(evaluation_regions)
+    out = torch.zeros((B, M), device=I_bhw.device, dtype=torch.float32)
+
+    for mi, (x0, x1, y0, y1) in enumerate(evaluation_regions):
+        patch = I_bhw[:, y0:y1, x0:x1]
+        hh, ww = patch.shape[-2], patch.shape[-1]
+        cmask = _make_circle_mask(hh, ww, float(detect_radius), device=I_bhw.device)
+        out[:, mi] = (patch * cmask.unsqueeze(0)).sum(dim=(-1, -2))
+
+    return out
+
+
+@torch.no_grad()
+def wavelength_energy_ratios_in_det(
+    I_blhw: torch.Tensor,  # (B, L, H, W)
+    evaluation_regions: list[tuple[int, int, int, int]],
+    detect_radius: int,
+    *,
+    L: int,
+    num_modes: int,
+) -> torch.Tensor:
+    """
+    波长间能量比例（仅统计“所有模式检测 ROI”内的能量）:
+      1) 每个波长：把该波长对应的 num_modes 个 ROI 能量求和 -> E_det[:, wl]
+      2) 在波长维归一化 -> p_wl (B, L)
+
+    evaluation_regions 的索引约定需与你主脚本一致：
+      label_idx = mode_k * L + wl_idx
+    """
+    B, Lloc, H, W = I_blhw.shape
+    if Lloc != L:
+        raise ValueError(f"I_blhw has L={Lloc}, but expected L={L}")
+
+    E_det = torch.zeros((B, L), device=I_blhw.device, dtype=torch.float32)
+
+    for wl_idx in range(L):
+        wl_regions = [evaluation_regions[k * L + wl_idx] for k in range(num_modes)]
+        E_k = region_energies_circle(I_blhw[:, wl_idx].to(torch.float32), wl_regions, detect_radius)
+        E_det[:, wl_idx] = E_k.sum(dim=1)
+
+    p_wl = E_det / (E_det.sum(dim=1, keepdim=True) + 1e-12)
+    return p_wl
+
 
 def build_superposition_eval_context(
     num_samples: int,

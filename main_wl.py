@@ -35,7 +35,7 @@ from odnn_processing import prepare_sample
 from odnn_multiwl_model import D2NNModelMultiWL
 
 # superposition sampler
-from odnn_training_eval import build_superposition_eval_context
+from odnn_training_eval import wavelength_energy_ratios_in_det
 
 
 # ============================================================
@@ -70,7 +70,7 @@ detectsize = circle_detectsize
 
 batch_size = 16
 
-evaluation_mode = "superposition"      # "eigenmode" or "superposition"
+evaluation_mode = "eigenmode"      # "eigenmode" or "superposition"
 training_dataset_mode = "eigenmode"    # "eigenmode" or "superposition"
 
 num_superposition_eval_samples = 1000
@@ -88,8 +88,10 @@ z_input_to_first = 40e-6
 
 # wavelengths (MultiWL)
 # wavelengths = np.array([650e-9, 1568e-9], dtype=np.float32)
-wavelengths = np.array([1550e-9], dtype=np.float32)
+# wavelengths = np.array([1550e-9], dtype=np.float32)
 # wavelengths = np.array([1550e-9, 1568e-9, 1650e-9], dtype=np.float32)
+# wavelengths = np.array([1530e-9, 1540e-9, 1550e-9], dtype=np.float32)
+wavelengths = np.array([1530e-9, 1535e-9, 1540e-9], dtype=np.float32)
 base_wavelength_idx = 0
 L = int(len(wavelengths))
 
@@ -104,7 +106,7 @@ lr = 1.99
 padding_ratio = 0.5
 
 # output root
-RUN_ROOT = Path(f"results/1550nm_base_{base_wavelength_idx}")
+RUN_ROOT = Path(f"results/eigenmode/1530-1540nm_base_{base_wavelength_idx}")
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 # prediction viz samples
@@ -348,7 +350,7 @@ def evaluate_spot_metrics_multiwl(
 
 
 @torch.no_grad()
-@torch.no_grad()
+
 def save_prediction_diagnostics_multiwl(
     model: D2NNModelMultiWL,
     dataset: TensorDataset,
@@ -380,6 +382,14 @@ def save_prediction_diagnostics_multiwl(
         xin = x.repeat(1, Lloc, 1, 1).contiguous()
         I_pred = model(xin)
 
+        p_wl = wavelength_energy_ratios_in_det(
+        I_blhw=I_pred,
+        evaluation_regions=evaluation_regions,
+        detect_radius=detect_radius,
+        L=Lloc,
+        num_modes=num_modes,
+        )[0].detach().cpu().numpy()  # (L,)
+
         I_in = (torch.abs(x[0, 0]) ** 2).detach().cpu().numpy()
 
         amp2 = (amp[0] ** 2).detach().cpu().numpy()
@@ -396,9 +406,14 @@ def save_prediction_diagnostics_multiwl(
             label_wl = np.einsum('nm,hwm->hw', energy, wl_label_patterns)  # (H, W)
             labels_per_wl.append(label_wl)
 
-        # 创建图形：Input + L个Label + L个Pred + L个柱状图
-        fig = plt.figure(figsize=(4 * (1 + 2*Lloc), 8))
-        gs = fig.add_gridspec(2, 1 + 2*Lloc, height_ratios=[1.0, 1.0])
+        # 创建图形：Input + L个Label + L个Pred + L个柱状图 + Wl个波长柱状图
+        fig = plt.figure(figsize=(4 * (1 + 2*Lloc), 10))  # 高度稍微加大
+        gs = fig.add_gridspec(
+            3, 1 + 2*Lloc,
+            height_ratios=[1.0, 1.0, 0.55],  # 第3行给波长柱状图
+            hspace=0.35,
+            wspace=0.25,
+        )
 
         # 第一列：输入
         ax0 = fig.add_subplot(gs[0, 0])
@@ -472,11 +487,27 @@ def save_prediction_diagnostics_multiwl(
 
         # 左下角空白
         fig.add_subplot(gs[1, 0]).axis("off")
+        # --- 最底部：波长间能量比例（横跨整张图）---
+        ax_wl = fig.add_subplot(gs[2, :])
+
+        xw = np.arange(Lloc)
+        ax_wl.bar(xw, p_wl, color="tab:blue", alpha=0.85)
+
+        ax_wl.set_ylim(0.0, 1.0)
+        ax_wl.set_ylabel("Energy Ratio")
+
+        # x 轴用 nm 标注
+        ax_wl.set_xticks(xw)
+        ax_wl.set_xticklabels([f"{w*1e9:.0f}" for w in wavelengths])
+        ax_wl.set_xlabel("Wavelength (nm)")
+
+        ax_wl.grid(True, axis="y", alpha=0.25)
+        ax_wl.set_title("Inter-wavelength Energy Ratios (sum over all mode ROIs)", fontsize=11)
 
         fig.suptitle(f"MultiWL Prediction Analysis - Sample {si}", 
                     fontsize=14, fontweight='bold', y=0.98)
-        fig.tight_layout(rect=[0, 0.0, 1, 0.96])
-        
+        fig.tight_layout(rect=[0, 0.02, 1, 0.96])
+
         out_path = out_dir / f"{tag}_sample{si:04d}.png"
         fig.savefig(out_path, dpi=250, bbox_inches="tight")
         plt.close(fig)
