@@ -79,6 +79,7 @@ superposition_eval_seed = 20240116
 superposition_train_seed = 20240115
 
 num_layer_option = [2, 3, 4, 5, 6]
+# num_layer_option = [7 ]
 
 # geometry / propagation params
 z_layers = 40e-6
@@ -286,6 +287,71 @@ def region_energy_fractions(
     out = out / (out.sum(dim=1, keepdim=True) + 1e-12)
     return out
 
+@torch.no_grad()
+def evaluate_target_wl_over_all_wl_roi_ratio(
+    model: D2NNModelMultiWL,
+    loader: DataLoader,
+    *,
+    device: torch.device,
+    evaluation_regions: list[tuple[int,int,int,int]],
+    detect_radius: int,
+    L: int,
+    num_modes: int,
+) -> dict:
+    """
+    对每个源波长s：
+      ratio_s = E(s->s) / sum_t E(s->t)
+    其中 E(s->t) 是源波长s的预测强度在“波长t的ROI集合(3个mode圆)”内的能量。
+    返回：
+      - ratio_mean: 标量（对样本与s平均）
+      - ratio_per_wl: (L,) 每个源波长的平均ratio
+    """
+    model.eval()
+
+    # 预取每个波长t的ROI集合（3个mode）
+    wl_regions = [
+        [evaluation_regions[m * L + t] for m in range(num_modes)]
+        for t in range(L)
+    ]
+
+    ratio_list = []
+
+    for images, label_img, amp in loader:
+        images = images.to(device, dtype=torch.complex64, non_blocking=True)
+        if images.ndim == 3:
+            images = images.unsqueeze(1)
+
+        x = images.repeat(1, L, 1, 1).contiguous()
+        I_blhw = model(x).to(torch.float32)  # (B,L,H,W)
+        B = I_blhw.shape[0]
+
+        ratios = torch.zeros((B, L), device=device, dtype=torch.float32)
+
+        for s in range(L):
+            src = I_blhw[:, s]  # (B,H,W)
+
+            # 计算 E(s->t) for all t
+            E_st = torch.zeros((B, L), device=device, dtype=torch.float32)
+            for t in range(L):
+                total = torch.zeros((B,), device=device, dtype=torch.float32)
+                for (x0, x1, y0, y1) in wl_regions[t]:
+                    patch = src[:, y0:y1, x0:x1]
+                    hh, ww = patch.shape[-2], patch.shape[-1]
+                    cmask = _make_circle_mask(hh, ww, float(detect_radius), device=device)
+                    total += (patch * cmask.unsqueeze(0)).sum(dim=(-1, -2))
+                E_st[:, t] = total
+
+            denom = E_st.sum(dim=1) + 1e-12
+            ratios[:, s] = E_st[:, s] / denom  # 目标波长/所有波长ROI集合
+
+        ratio_list.append(ratios.detach().cpu())
+
+    ratio_all = torch.cat(ratio_list, dim=0).numpy()  # (N,L)
+
+    return {
+        "ratio_mean": float(ratio_all.mean()),
+        "ratio_per_wl": ratio_all.mean(axis=0),  # (L,)
+    }
 
 @torch.no_grad()
 def evaluate_spot_metrics_multiwl(
@@ -366,6 +432,7 @@ def save_prediction_diagnostics_multiwl(
 ):
     """
     保存预测诊断图（为每个波长显示独立的标签）
+    最底部一行：改为“每个模式下，三个波长的 energy ratio”（对每个 mode 在波长维归一化）
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     Lloc = int(len(wavelengths))
@@ -375,42 +442,35 @@ def save_prediction_diagnostics_multiwl(
         x, label_img, amp = dataset[si]
         if x.ndim == 2:
             x = x.unsqueeze(0)
-        x = x.to(device=device, dtype=torch.complex64).unsqueeze(0)
+        x = x.to(device=device, dtype=torch.complex64).unsqueeze(0)              # (1,1,H,W)
         label_img = label_img.to(device=device, dtype=torch.float32).unsqueeze(0)
-        amp = amp.to(device=device, dtype=torch.float32).unsqueeze(0)
+        amp = amp.to(device=device, dtype=torch.float32).unsqueeze(0)            # (1,M)
 
-        xin = x.repeat(1, Lloc, 1, 1).contiguous()
-        I_pred = model(xin)
-
-        p_wl = wavelength_energy_ratios_in_det(
-        I_blhw=I_pred,
-        evaluation_regions=evaluation_regions,
-        detect_radius=detect_radius,
-        L=Lloc,
-        num_modes=num_modes,
-        )[0].detach().cpu().numpy()  # (L,)
+        xin = x.repeat(1, Lloc, 1, 1).contiguous()  # (1,L,H,W)
+        I_pred = model(xin)                         # (1,L,H,W) float
 
         I_in = (torch.abs(x[0, 0]) ** 2).detach().cpu().numpy()
 
         amp2 = (amp[0] ** 2).detach().cpu().numpy()
         true_energy_frac = _safe_norm_np(amp2)
 
-        # 🔧 关键修改：为每个波长生成独立的标签图
+        # 为每个波长生成独立的标签图
         labels_per_wl = []
         for wl_idx in range(Lloc):
             label_indices = [k * Lloc + wl_idx for k in range(num_modes)]
             wl_label_patterns = MMF_Label_data[:, :, label_indices].numpy()  # (H, W, M)
-            
+
             # 使用真实能量分布生成该波长的标签
             energy = true_energy_frac.reshape(1, -1)  # (1, M)
-            label_wl = np.einsum('nm,hwm->hw', energy, wl_label_patterns)  # (H, W)
+            label_wl = np.einsum("nm,hwm->hw", energy, wl_label_patterns)  # (H, W)
             labels_per_wl.append(label_wl)
 
-        # 创建图形：Input + L个Label + L个Pred + L个柱状图 + Wl个波长柱状图
-        fig = plt.figure(figsize=(4 * (1 + 2*Lloc), 10))  # 高度稍微加大
+        # 创建图形：Input + L个Label + L个Pred + L个柱状图 + 最底部一个柱状图
+        fig = plt.figure(figsize=(4 * (1 + 2 * Lloc), 10))
         gs = fig.add_gridspec(
-            3, 1 + 2*Lloc,
-            height_ratios=[1.0, 1.0, 0.55],  # 第3行给波长柱状图
+            3,
+            1 + 2 * Lloc,
+            height_ratios=[1.0, 1.0, 0.55],
             hspace=0.35,
             wspace=0.25,
         )
@@ -418,94 +478,180 @@ def save_prediction_diagnostics_multiwl(
         # 第一列：输入
         ax0 = fig.add_subplot(gs[0, 0])
         ax0.imshow(I_in, cmap="inferno")
-        ax0.set_title("Input |E|^2", fontsize=10, fontweight='bold')
+        ax0.set_title("Input |E|^2", fontsize=10, fontweight="bold")
         ax0.axis("off")
 
-        # 为每个波长显示：Label + Pred
+        # 为每个波长显示：Label + Pred + 该波长的模式能量柱状图
         for li in range(Lloc):
             # Label 列
-            ax_label = fig.add_subplot(gs[0, 1 + 2*li])
+            ax_label = fig.add_subplot(gs[0, 1 + 2 * li])
             ax_label.imshow(labels_per_wl[li], cmap="inferno")
-            ax_label.set_title(f"Label λ={wavelengths[li]*1e9:.0f}nm", 
-                              fontsize=10, fontweight='bold')
+            ax_label.set_title(
+                f"Label λ={wavelengths[li] * 1e9:.0f}nm",
+                fontsize=10,
+                fontweight="bold",
+            )
             ax_label.axis("off")
 
-            # 绘制该波长对应的标签区域
+            # 绘制该波长对应的标签区域（只画该波长的3个ROI）
             wl_regions = [evaluation_regions[k * Lloc + li] for k in range(num_modes)]
             for region_idx, (x0, x1, y0, y1) in enumerate(wl_regions):
                 color = plt.cm.tab10(li % 10)
-                rect = Rectangle((x0, y0), x1 - x0, y1 - y0, linewidth=1.2, 
-                               edgecolor=color, facecolor="none", alpha=0.9)
+                rect = Rectangle(
+                    (x0, y0),
+                    x1 - x0,
+                    y1 - y0,
+                    linewidth=1.2,
+                    edgecolor=color,
+                    facecolor="none",
+                    alpha=0.9,
+                )
                 ax_label.add_patch(rect)
                 cx = (x0 + x1) / 2.0
                 cy = (y0 + y1) / 2.0
-                ax_label.add_patch(Circle((cx, cy), radius=detect_radius, linewidth=1.0, 
-                                    edgecolor=color, linestyle="--", fill=False, alpha=0.9))
-                # 标注模式索引
-                ax_label.text(cx, cy, f"M{region_idx}", ha='center', va='center', 
-                            color='white', fontsize=8, fontweight='bold',
-                            bbox=dict(boxstyle='round,pad=0.3', facecolor=color, alpha=0.7))
+                ax_label.add_patch(
+                    Circle(
+                        (cx, cy),
+                        radius=detect_radius,
+                        linewidth=1.0,
+                        edgecolor=color,
+                        linestyle="--",
+                        fill=False,
+                        alpha=0.9,
+                    )
+                )
+                ax_label.text(
+                    cx,
+                    cy,
+                    f"M{region_idx}",
+                    ha="center",
+                    va="center",
+                    color="white",
+                    fontsize=8,
+                    fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.3", facecolor=color, alpha=0.7),
+                )
 
             # Pred 列
-            axI = fig.add_subplot(gs[0, 2 + 2*li])
+            axI = fig.add_subplot(gs[0, 2 + 2 * li])
             I_li = I_pred[0, li].detach().cpu().numpy()
             axI.imshow(I_li, cmap="inferno")
-            axI.set_title(f"Pred λ={wavelengths[li]*1e9:.0f}nm", 
-                         fontsize=10, fontweight='bold')
+            axI.set_title(
+                f"Pred λ={wavelengths[li] * 1e9:.0f}nm",
+                fontsize=10,
+                fontweight="bold",
+            )
             axI.axis("off")
 
             # 绘制预测图上的区域框
             for region_idx, (x0, x1, y0, y1) in enumerate(wl_regions):
                 color = plt.cm.tab10(li % 10)
-                rect = Rectangle((x0, y0), x1 - x0, y1 - y0, linewidth=1.2, 
-                               edgecolor=color, facecolor="none", alpha=0.9)
+                rect = Rectangle(
+                    (x0, y0),
+                    x1 - x0,
+                    y1 - y0,
+                    linewidth=1.2,
+                    edgecolor=color,
+                    facecolor="none",
+                    alpha=0.9,
+                )
                 axI.add_patch(rect)
                 cx = (x0 + x1) / 2.0
                 cy = (y0 + y1) / 2.0
-                axI.add_patch(Circle((cx, cy), radius=detect_radius, linewidth=1.0, 
-                                    edgecolor=color, linestyle="--", fill=False, alpha=0.9))
+                axI.add_patch(
+                    Circle(
+                        (cx, cy),
+                        radius=detect_radius,
+                        linewidth=1.0,
+                        edgecolor=color,
+                        linestyle="--",
+                        fill=False,
+                        alpha=0.9,
+                    )
+                )
 
-            # 能量柱状图
-            I_bhw = I_pred[:, li].to(torch.float32)
+            # 能量柱状图（该波长下：3个模式的能量比例）
+            I_bhw = I_pred[:, li].to(torch.float32)  # (1,H,W)
             pred_energy_frac = region_energy_fractions(
                 I_bhw, wl_regions, detect_radius=detect_radius
-            )[0].detach().cpu().numpy()
+            )[0].detach().cpu().numpy()  # (M,)
 
-            axb = fig.add_subplot(gs[1, 1 + 2*li:3 + 2*li])  # 跨两列
+            axb = fig.add_subplot(gs[1, 1 + 2 * li : 3 + 2 * li])  # 跨两列
             idx = np.arange(num_modes)
             width = 0.35
-            axb.bar(idx - width/2, true_energy_frac, width, label="True", alpha=0.8)
-            axb.bar(idx + width/2, pred_energy_frac, width, label="Pred", alpha=0.8)
+            axb.bar(idx - width / 2, true_energy_frac, width, label="True", alpha=0.8)
+            axb.bar(idx + width / 2, pred_energy_frac, width, label="Pred", alpha=0.8)
             axb.set_ylim(0, 1.0)
             axb.set_xticks(idx)
             axb.set_xticklabels([f"M{i}" for i in idx])
-            axb.grid(True, alpha=0.3, axis='y')
-            axb.set_title(f"Energy Ratio (λ={wavelengths[li]*1e9:.0f}nm)", fontsize=10)
+            axb.grid(True, alpha=0.3, axis="y")
+            axb.set_title(f"Energy Ratio (λ={wavelengths[li] * 1e9:.0f}nm)", fontsize=10)
             axb.set_ylabel("Energy Fraction")
             if li == 0:
-                axb.legend(loc='upper right')
+                axb.legend(loc="upper right")
 
         # 左下角空白
         fig.add_subplot(gs[1, 0]).axis("off")
-        # --- 最底部：波长间能量比例（横跨整张图）---
+
+        # --- 最底部：对每个“源波长(当前Label)”，真实能量在3个“波长ROI集合”之间的占比（只画True）---
         ax_wl = fig.add_subplot(gs[2, :])
 
-        xw = np.arange(Lloc)
-        ax_wl.bar(xw, p_wl, color="tab:blue", alpha=0.85)
+        # R[s, t]: 使用 labels_per_wl[s] 的强度，在 “波长t的ROI集合(含M0/M1/M2)” 内的能量占比
+        R = np.zeros((Lloc, Lloc), dtype=np.float64)
+
+        for s in range(Lloc):
+            src_img = I_pred[0, s].detach().cpu().numpy()
+            E_st = np.zeros(Lloc, dtype=np.float64)
+            for t in range(Lloc):
+                # 取“波长t”的ROI集合：3个mode对应的3个ROI
+                t_regions = [evaluation_regions[m * Lloc + t] for m in range(num_modes)]
+
+                total = 0.0
+                for (x0, x1, y0, y1) in t_regions:
+                    patch = src_img[y0:y1, x0:x1]
+                    h, w = patch.shape
+                    yy, xx = np.ogrid[:h, :w]
+                    cy = (h - 1) / 2.0
+                    cx = (w - 1) / 2.0
+                    mask = (xx - cx) ** 2 + (yy - cy) ** 2 <= float(detect_radius) ** 2
+                    total += float(patch[mask].sum())
+
+                E_st[t] = total
+
+            R[s] = E_st / (E_st.sum() + 1e-12)
+
+        # 分组柱：x轴是“源波长 s”，每组3根柱是“ROI集合波长 t”
+        x = np.arange(Lloc)
+        group_width = 0.85
+        bar_w = group_width / Lloc
+
+        for t in range(Lloc):
+            offset = (t - (Lloc - 1) / 2.0) * bar_w
+            ax_wl.bar(
+                x + offset,
+                R[:, t],
+                width=bar_w * 0.95,
+                alpha=0.85,
+                label=f"ROI@{wavelengths[t]*1e9:.0f}nm",
+            )
 
         ax_wl.set_ylim(0.0, 1.0)
-        ax_wl.set_ylabel("Energy Ratio")
-
-        # x 轴用 nm 标注
-        ax_wl.set_xticks(xw)
-        ax_wl.set_xticklabels([f"{w*1e9:.0f}" for w in wavelengths])
-        ax_wl.set_xlabel("Wavelength (nm)")
-
+        ax_wl.set_ylabel("True Energy Ratio\n(over ROI wavelength sets)")
+        ax_wl.set_xticks(x)
+        ax_wl.set_xticklabels([f"{w * 1e9:.0f}" for w in wavelengths])
+        ax_wl.set_xlabel("Source wavelength (Label) (nm)")
         ax_wl.grid(True, axis="y", alpha=0.25)
-        ax_wl.set_title("Inter-wavelength Energy Ratios (sum over all mode ROIs)", fontsize=11)
+        ax_wl.set_title("True energy distribution of each Label(λ) across wavelength-ROI sets", fontsize=11)
+        ax_wl.legend(ncol=min(Lloc, 6), fontsize=9, loc="upper right")
 
-        fig.suptitle(f"MultiWL Prediction Analysis - Sample {si}", 
-                    fontsize=14, fontweight='bold', y=0.98)
+
+
+        fig.suptitle(
+            f"MultiWL Prediction Analysis - Sample {si}",
+            fontsize=14,
+            fontweight="bold",
+            y=0.98,
+        )
         fig.tight_layout(rect=[0, 0.02, 1, 0.96])
 
         out_path = out_dir / f"{tag}_sample{si:04d}.png"
@@ -725,6 +871,7 @@ def build_superposition_dataset_multiwl(num_samples: int, rng_seed: int) -> tupl
 # ============================================================
 all_losses: list[list[float]] = []
 metrics_by_wl: dict[int, list[dict]] = {int(li): [] for li in range(L)}
+target_ratio_per_layer: dict[int, np.ndarray] = {}  # key=num_layers -> (L,)
 
 detect_radius_eval = int(detectsize // 2)
 
@@ -905,6 +1052,23 @@ for num_layer in num_layer_option:
         )
 
         metrics_by_wl[int(li)].append({"num_layers": int(num_layer), **metrics})
+        # ===== 新增：目标波长ROI能量 / 所有波长ROI能量（一次性算全波长）=====
+        test_loader_any = DataLoader(test_datasets_per_wl[0], batch_size=batch_size, shuffle=False)
+        wl_ratio = evaluate_target_wl_over_all_wl_roi_ratio(
+            model,
+            test_loader_any,
+            device=device,
+            evaluation_regions=evaluation_regions,
+            detect_radius=detect_radius_eval,
+            L=L,
+            num_modes=num_modes,
+        )
+        target_ratio_per_layer[int(num_layer)] = wl_ratio["ratio_per_wl"]
+
+        print(
+            f"[TargetWL/AllWL ROI | {num_layer} layers] "
+            f"mean={wl_ratio['ratio_mean']:.6f}, per_wl={wl_ratio['ratio_per_wl']}"
+        )
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
@@ -932,7 +1096,8 @@ for li in range(L):
     cc_amp_mean = np.asarray([float(np.nanmean(m["cc_recon_amp"])) for m in mlist], dtype=np.float64)
     cc_amp_std = np.asarray([float(np.nanstd(m["cc_recon_amp"])) for m in mlist], dtype=np.float64)
 
-    fig, axes = plt.subplots(3, 1, figsize=(7, 9), sharex=True)
+    fig, axes = plt.subplots(4, 1, figsize=(7, 11), sharex=True)
+
 
     axes[0].plot(layer_counts, amp_err, marker="o")
     axes[0].set_ylabel("Avg Amplitude Error")
@@ -944,9 +1109,19 @@ for li in range(L):
 
     axes[2].errorbar(layer_counts, cc_amp_mean, yerr=cc_amp_std, marker="o", capsize=4, color="tab:green")
     axes[2].set_ylabel("Correlation Coef")
-    axes[2].set_xlabel("Number of Layers")
     axes[2].grid(True, alpha=0.3)
     axes[2].set_ylim(0.0, 1.01)
+
+    # 第4行：目标波长ROI能量 / 所有波长ROI能量
+    tgt_curve = np.asarray(
+        [target_ratio_per_layer[int(nl)][li] for nl in layer_counts],
+        dtype=np.float64,
+    )
+    axes[3].plot(layer_counts, tgt_curve, marker="o", color="tab:purple")
+    axes[3].set_ylabel("TargetWL / AllWL (ROI)")
+    axes[3].set_xlabel("Number of Layers")
+    axes[3].grid(True, alpha=0.3)
+    axes[3].set_ylim(0.0, 1.01)
 
     fig.suptitle(f"Metrics vs Layers | λ={wavelengths[li]*1e9:.1f} nm")
     fig.tight_layout(rect=[0, 0.0, 1, 0.96])
@@ -965,6 +1140,7 @@ for li in range(L):
             "avg_relative_amp_error": amp_err_rel,
             "cc_amp_mean": cc_amp_mean,
             "cc_amp_std": cc_amp_std,
+            "target_wl_over_all_wl_roi": tgt_curve,
             "wavelength_nm": np.array([wavelengths[li] * 1e9], dtype=np.float32),
         },
     )
