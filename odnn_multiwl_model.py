@@ -4,6 +4,52 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+# ========================= 新增代码1：轻量级调制网络 =========================
+class WavelengthModulationNetwork(nn.Module):
+    """
+    轻量级MLP：波长 → 相位调制
+    参数量：仅约10k
+    """
+    def __init__(self, units, hidden_dim=32):
+        super().__init__()
+        self.units = units
+        
+        # 小型MLP
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 256),  # 输出低分辨率 16×16
+            nn.Tanh()
+        )
+    
+    def forward(self, wavelength):
+        """
+        wavelength: scalar (e.g., 1530.0)
+        return: (units, units) 相位调制矩阵
+        """
+        # 归一化波长到 [-1, 1]
+        wl_normalized = (wavelength - 1547.5) / 17.5
+        wl_input = torch.tensor([[wl_normalized]], 
+                               dtype=torch.float32,
+                               device=self.mlp[0].weight.device)
+        
+        # 通过MLP生成低分辨率调制
+        modulation_flat = self.mlp(wl_input)  # (1, 256)
+        modulation_small = modulation_flat.view(1, 1, 16, 16)  # (1, 1, 16, 16)
+        
+        # 上采样到目标尺寸
+        modulation = F.interpolate(
+            modulation_small,
+            size=(self.units, self.units),
+            mode='bilinear',
+            align_corners=True
+        ).squeeze()  # (units, units)
+        
+        return modulation
+
+
 # -------------------------
 # Complex padding helpers
 # -------------------------
@@ -102,9 +148,12 @@ class DiffractionLayerMultiWL(nn.Module):
     多波长衍射层：相位掩膜对不同 λ 按 lam0/lam 缩放 + 多波长传播
     inputs:  (B, L, H, W) complex
     outputs: (B, L, H, W) complex
+    
+    ===== 改进版：添加了波长特定调制 =====
     """
 
-    def __init__(self, units, dx, wavelengths, z, device, pad_px=0, base_wavelength_idx=None):
+    def __init__(self, units, dx, wavelengths, z, device, pad_px=0, base_wavelength_idx=None, 
+                 modulation_network=None):  # ← 新增参数
         super().__init__()
         self.units = int(units)
         self.dx = float(dx)
@@ -121,6 +170,12 @@ class DiffractionLayerMultiWL(nn.Module):
 
         # trainable base mask phase for lam0
         self.phase = nn.Parameter(torch.randn(self.units, self.units, dtype=torch.float32))
+
+        # ===== 新增：波长调制网络 =====
+        self.modulation_network = modulation_network
+        if self.modulation_network is not None:
+            self.modulation_strength = nn.Parameter(torch.tensor(0.3))
+        # ================================
 
         # kz stacks
         self.register_buffer("kz_base", PropagationMultiWL._make_kz_stack(self.units, self.dx, wl, device))
@@ -140,7 +195,26 @@ class DiffractionLayerMultiWL(nn.Module):
 
         # build wavelength-scaled phase: phi_l = phi0 * (lam0/lam_l)
         scale = (self.lam0 / self.wavelengths).to(inputs.device)          # (L,)
-        phi = self.phase[None, :, :] * scale[:, None, None]               # (L,H,W)
+        
+        # ===== 修改：添加波长特定调制 =====
+        phi_list = []
+        for i in range(L):
+            # 原有的波长缩放
+            phi_scaled = self.phase * scale[i]
+            
+            # 如果有调制网络，添加波长特定调制
+            if self.modulation_network is not None:
+                wl_value = self.wavelengths[i].item()
+                modulation = self.modulation_network(wl_value)  # (units, units)
+                phi_i = phi_scaled + self.modulation_strength * modulation
+            else:
+                phi_i = phi_scaled
+            
+            phi_list.append(phi_i)
+        
+        phi = torch.stack(phi_list, dim=0)  # (L, H, W)
+        # ====================================
+        
         phase_c = torch.exp(1j * phi).to(torch.complex64)                 # (L,H,W)
 
         if self.pad_px > 0:
@@ -184,6 +258,8 @@ class D2NNModelMultiWL(nn.Module):
     """
     inputs:  (B, L, H, W) complex
     outputs: (B, L, H, W) intensity
+    
+    ===== 改进版：添加了波长调制网络 =====
     """
     def __init__(
         self,
@@ -197,14 +273,26 @@ class D2NNModelMultiWL(nn.Module):
         padding_ratio=0.5,
         z_input_to_first=0.0,
         base_wavelength_idx=None,
+        use_wavelength_modulation=True,  # ← 新增参数：是否启用调制
     ):
         super().__init__()
         pad_px = int(round(layer_size * padding_ratio))
+
+        # ===== 新增：创建共享的波长调制网络 =====
+        if use_wavelength_modulation:
+            self.shared_modulation_network = WavelengthModulationNetwork(
+                units=layer_size,
+                hidden_dim=32
+            ).to(device)
+        else:
+            self.shared_modulation_network = None
+        # =========================================
 
         self.pre_propagation = PropagationMultiWL(
             layer_size, pixel_size, wavelengths, z_input_to_first, device, pad_px=pad_px
         )
 
+        # ===== 修改：传入调制网络 =====
         self.layers = nn.ModuleList(
             [
                 DiffractionLayerMultiWL(
@@ -215,10 +303,12 @@ class D2NNModelMultiWL(nn.Module):
                     device,
                     pad_px=pad_px,
                     base_wavelength_idx=base_wavelength_idx,
+                    modulation_network=self.shared_modulation_network,  # ← 传入调制网络
                 )
                 for _ in range(int(num_layers))
             ]
         )
+        # ================================
 
         self.propagation = PropagationMultiWL(
             layer_size, pixel_size, wavelengths, z_prop, device, pad_px=pad_px

@@ -88,12 +88,9 @@ z_prop = 120e-6
 z_input_to_first = 40e-6
 
 # wavelengths (MultiWL)
-# wavelengths = np.array([650e-9, 1568e-9], dtype=np.float32)
-# wavelengths = np.array([1550e-9], dtype=np.float32)
 # wavelengths = np.array([1550e-9, 1568e-9, 1650e-9], dtype=np.float32)
-# wavelengths = np.array([1530e-9, 1540e-9, 1550e-9], dtype=np.float32)
-wavelengths = np.array([1530e-9, 1540e-9, 1550e-9, 1560e-9], dtype=np.float32)
-# wavelengths = np.array([1530e-9, 1535e-9, 1540e-9, 1545e-9, 1550e-9, 1555e-9, 1560e-9, 1565e-9], dtype=np.float32)
+# wavelengths = np.array([1530e-9, 1540e-9, 1550e-9, 1560e-9], dtype=np.float32)
+wavelengths = np.array([1530e-9, 1535e-9, 1540e-9], dtype=np.float32)
 base_wavelength_idx = 0
 L = int(len(wavelengths))
 
@@ -108,7 +105,7 @@ lr = 1.99
 padding_ratio = 0.5
 
 # output root
-RUN_ROOT = Path(f"results/eigenmode/10nm_gap_base_{base_wavelength_idx}")
+RUN_ROOT = Path(f"results/eigenmode/5nm_gap_test_base_{base_wavelength_idx}")
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 # prediction viz samples
