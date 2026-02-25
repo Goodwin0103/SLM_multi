@@ -60,7 +60,7 @@ print("Using Device:", device)
 # Parameters
 # ============================================================
 field_size = 25
-layer_size = 110
+layer_size = 200
 num_modes = 3
 
 circle_focus_radius = 5
@@ -78,7 +78,7 @@ num_superposition_train_samples = 100
 superposition_eval_seed = 20240116
 superposition_train_seed = 20240115
 
-num_layer_option = [2, 3, 4, 5, 6]
+num_layer_option = [2, 3, 4, 5, 6, 7, 8, 9, 10]
 # num_layer_option = [7 ]
 
 # geometry / propagation params
@@ -92,7 +92,7 @@ z_input_to_first = 40e-6
 # wavelengths = np.array([1550e-9], dtype=np.float32)
 # wavelengths = np.array([1550e-9, 1568e-9, 1650e-9], dtype=np.float32)
 # wavelengths = np.array([1530e-9, 1540e-9, 1550e-9], dtype=np.float32)
-wavelengths = np.array([1530e-9, 1535e-9, 1540e-9], dtype=np.float32)
+wavelengths = np.array([1530e-9, 1535e-9, 1540e-9, 1545e-9, 1550e-9, 1555e-9, 1560e-9, 1565e-9], dtype=np.float32)
 base_wavelength_idx = 0
 L = int(len(wavelengths))
 
@@ -107,7 +107,7 @@ lr = 1.99
 padding_ratio = 0.5
 
 # output root
-RUN_ROOT = Path(f"results/eigenmode/1530-1540nm_base_{base_wavelength_idx}")
+RUN_ROOT = Path(f"results/eigenmode/5nm_gap_base_{base_wavelength_idx}")
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 # prediction viz samples
@@ -136,12 +136,22 @@ def generate_detector_patterns_multiwl(
     """
     total_labels = num_modes * num_wavelengths
     
-    # 计算布局
-    num_rows = int(np.floor(np.sqrt(total_labels)))
-    num_cols = int(np.ceil(total_labels / num_rows))
-    
-    # 计算中心坐标
-    centers, row_spacing, col_spacing = compute_label_centers(H, W, total_labels, radius)
+    # ===== 新布局：每个 mode 一行，每个波长一列（从左到右递增）=====
+    num_rows = num_modes
+    num_cols = num_wavelengths
+
+    margin = radius + 3  # 边界留白，可调
+    xs = np.linspace(margin, W - 1 - margin, num_cols)
+    ys = np.linspace(margin, H - 1 - margin, num_rows)
+
+    # centers 顺序必须保持：idx = mode * L + wl（mode-major）
+    centers = []
+    for mode_idx in range(num_rows):
+        for wl_idx in range(num_cols):
+            cx = int(round(xs[wl_idx]))
+            cy = int(round(ys[mode_idx]))
+            centers.append((cy, cx))
+
     
     # 生成图案
     if pattern_mode == "circle":
@@ -1053,22 +1063,22 @@ for num_layer in num_layer_option:
 
         metrics_by_wl[int(li)].append({"num_layers": int(num_layer), **metrics})
         # ===== 新增：目标波长ROI能量 / 所有波长ROI能量（一次性算全波长）=====
-        test_loader_any = DataLoader(test_datasets_per_wl[0], batch_size=batch_size, shuffle=False)
-        wl_ratio = evaluate_target_wl_over_all_wl_roi_ratio(
-            model,
-            test_loader_any,
-            device=device,
-            evaluation_regions=evaluation_regions,
-            detect_radius=detect_radius_eval,
-            L=L,
-            num_modes=num_modes,
-        )
-        target_ratio_per_layer[int(num_layer)] = wl_ratio["ratio_per_wl"]
+    test_loader_any = DataLoader(test_datasets_per_wl[0], batch_size=batch_size, shuffle=False)
+    wl_ratio = evaluate_target_wl_over_all_wl_roi_ratio(
+        model,
+        test_loader_any,
+        device=device,
+        evaluation_regions=evaluation_regions,
+        detect_radius=detect_radius_eval,
+        L=L,
+        num_modes=num_modes,
+    )
+    target_ratio_per_layer[int(num_layer)] = wl_ratio["ratio_per_wl"]
 
-        print(
-            f"[TargetWL/AllWL ROI | {num_layer} layers] "
-            f"mean={wl_ratio['ratio_mean']:.6f}, per_wl={wl_ratio['ratio_per_wl']}"
-        )
+    print(
+        f"[TargetWL/AllWL ROI | {num_layer} layers] "
+        f"mean={wl_ratio['ratio_mean']:.6f}, per_wl={wl_ratio['ratio_per_wl']}"
+    )
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
