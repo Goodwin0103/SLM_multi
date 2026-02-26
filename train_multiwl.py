@@ -12,6 +12,12 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle, Circle
+# 在现有的 import 语句后添加
+from odnn_gradient_analysis import (
+    diagnose_gradient_conflict_before_training,
+    monitor_gradient_conflict_during_training,
+    detailed_gradient_analysis_after_training,
+)
 
 import numpy as np
 import torch
@@ -34,7 +40,9 @@ from odnn_processing import prepare_sample
 # MultiWL model
 from odnn_multiwl_model import D2NNModelMultiWL
 
-from odnn_training_io import train_multiwl_staged, print_stage_summary, save_staged_training_info
+# superposition sampler
+from odnn_training_eval import wavelength_energy_ratios_in_det
+
 
 # ============================================================
 # Reproducibility / device
@@ -104,7 +112,7 @@ lr = 1.99
 padding_ratio = 0.5
 
 # output root
-RUN_ROOT = Path(f"results/eigenmode/5nm_gap_test1_base_{base_wavelength_idx}")
+RUN_ROOT = Path(f"results/eigenmode/5nm_gap_test0_base_{base_wavelength_idx}")
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 # prediction viz samples
@@ -306,10 +314,20 @@ def evaluate_target_wl_over_all_wl_roi_ratio(
     num_modes: int,
 ) -> dict:
     """
-    修正版：对每个源波长s，计算它在"自己的ROI集合"中的能量占比
-    ratio_s = E(s在s的ROI) / E(s在所有ROI)
+    对每个源波长s：
+      ratio_s = E(s->s) / sum_t E(s->t)
+    其中 E(s->t) 是源波长s的预测强度在“波长t的ROI集合(3个mode圆)”内的能量。
+    返回：
+      - ratio_mean: 标量（对样本与s平均）
+      - ratio_per_wl: (L,) 每个源波长的平均ratio
     """
     model.eval()
+
+    # 预取每个波长t的ROI集合（3个mode）
+    wl_regions = [
+        [evaluation_regions[m * L + t] for m in range(num_modes)]
+        for t in range(L)
+    ]
 
     ratio_list = []
 
@@ -325,27 +343,21 @@ def evaluate_target_wl_over_all_wl_roi_ratio(
         ratios = torch.zeros((B, L), device=device, dtype=torch.float32)
 
         for s in range(L):
-            src = I_blhw[:, s]  # (B,H,W) - 源波长s的输出
+            src = I_blhw[:, s]  # (B,H,W)
 
-            # 🔑 关键修改：计算在"每个波长ROI集合"中的能量
-            E_in_each_wl_roi = torch.zeros((B, L), device=device, dtype=torch.float32)
-            
+            # 计算 E(s->t) for all t
+            E_st = torch.zeros((B, L), device=device, dtype=torch.float32)
             for t in range(L):
-                # 波长t的ROI集合（3个mode）
-                t_regions = [evaluation_regions[m * L + t] for m in range(num_modes)]
-                
                 total = torch.zeros((B,), device=device, dtype=torch.float32)
-                for (x0, x1, y0, y1) in t_regions:
+                for (x0, x1, y0, y1) in wl_regions[t]:
                     patch = src[:, y0:y1, x0:x1]
                     hh, ww = patch.shape[-2], patch.shape[-1]
                     cmask = _make_circle_mask(hh, ww, float(detect_radius), device=device)
                     total += (patch * cmask.unsqueeze(0)).sum(dim=(-1, -2))
-                
-                E_in_each_wl_roi[:, t] = total
+                E_st[:, t] = total
 
-            # 🔑 ratio = E(s在s的ROI) / E(s在所有ROI)
-            denom = E_in_each_wl_roi.sum(dim=1) + 1e-12
-            ratios[:, s] = E_in_each_wl_roi[:, s] / denom
+            denom = E_st.sum(dim=1) + 1e-12
+            ratios[:, s] = E_st[:, s] / denom  # 目标波长/所有波长ROI集合
 
         ratio_list.append(ratios.detach().cpu())
 
@@ -915,6 +927,52 @@ for num_layer in num_layer_option:
         base_wavelength_idx=base_wavelength_idx,
     ).to(device)
 
+    optimizer = optim.Adam(model.parameters(), lr=lr)
+    scheduler = ExponentialLR(optimizer, gamma=0.99)
+
+    # ============================================================
+    # 🔍 步骤1：训练前梯度冲突诊断
+    # ============================================================
+    print("\n" + "="*70)
+    print("步骤1: 训练前梯度冲突诊断")
+    print("="*70)
+
+    # 创建临时数据加载器用于诊断
+    g_diag = torch.Generator()
+    g_diag.manual_seed(SEED)
+    diag_loader = DataLoader(
+        train_datasets_per_wl[0],  # 使用第一个波长的数据集
+        batch_size=batch_size,
+        shuffle=True,
+        generator=g_diag
+    )
+
+    # 执行诊断
+    conflict_matrix, conflict_metrics = diagnose_gradient_conflict_before_training(
+        model=model,
+        wavelengths=wavelengths,
+        train_loader=diag_loader,
+        device=device,
+        num_batches=10,  # 只用10个batch，快速诊断
+        save_dir=RUN_ROOT / "gradient_analysis" / f"L{num_layer}_diagnosis",
+    )
+
+    # 根据诊断结果决定是否需要调整训练策略
+    if conflict_metrics['negative_ratio'] > 0.3:
+        print("\n⚠️  检测到严重梯度冲突！")
+        print("   建议：")
+        print("   1. 使用分阶段训练（先训练稀疏波长）")
+        print("   2. 降低学习率")
+        print("   3. 增加层数")
+        # 可选：自动调整学习率
+        # lr = lr * 0.5
+        # optimizer = optim.Adam(model.parameters(), lr=lr)
+
+    # 训练
+    losses: list[float] = []
+    epoch_durations: list[float] = []
+    t0 = time.time()
+
     # 训练
     losses: list[float] = []
     epoch_durations: list[float] = []
@@ -923,49 +981,91 @@ for num_layer in num_layer_option:
     g = torch.Generator()
     g.manual_seed(SEED)
 
-    # 🔑 使用分阶段训练
-    training_result = train_multiwl_staged(
-        model=model,
-        train_datasets_per_wl=train_datasets_per_wl,
-        wavelengths=wavelengths,
-        base_wavelength_idx=base_wavelength_idx,
-        epochs=epochs,
-        batch_size=batch_size,
-        lr=lr,
-        device=device,
-        seed=SEED,
-        scheduler_gamma=0.99,
-        stage_ratios=[0.25, 0.25, 0.25, 0.25],  # 可自定义
-        verbose=True,
-    )
-    
-    # 提取结果
-    losses = training_result['losses']
-    epoch_durations = training_result['epoch_durations']
-    stage_info = training_result['stage_info']
-    total_time = training_result['total_time']
-    all_losses.append(losses)
-    # 打印摘要
-    print_stage_summary(stage_info)
-    
-    # 在 save_staged_training_info 之后添加
-    training_output_dir = RUN_ROOT / "training_analysis"
+    for epoch in range(1, epochs + 1):
+        epoch_t0 = time.time()
+        model.train()
+        epoch_loss = 0.0
+        batch_count = 0
 
-    # 🔑 保存训练曲线
+        # 🔧 关键修改：遍历每个波长
+        for wl_idx in range(L):
+            train_loader_wl = DataLoader(
+                train_datasets_per_wl[wl_idx], 
+                batch_size=batch_size, 
+                shuffle=True, 
+                generator=g
+            )
+            
+            for images, label_img, amp in train_loader_wl:
+                images = images.to(device, dtype=torch.complex64, non_blocking=True)
+                label_img = label_img.to(device, dtype=torch.float32, non_blocking=True)
+
+                if images.ndim == 3:
+                    images = images.unsqueeze(1)
+
+                x = images.repeat(1, L, 1, 1).contiguous()
+
+                optimizer.zero_grad(set_to_none=True)
+                I_blhw = model(x)
+                
+                # 只计算当前波长的损失
+                loss = F.mse_loss(I_blhw[:, wl_idx], label_img[:, 0])
+                
+                loss.backward()
+                optimizer.step()
+                epoch_loss += float(loss.item())
+                batch_count += 1
+
+        scheduler.step()
+        avg_loss = epoch_loss / max(1, batch_count)
+        losses.append(avg_loss)
+
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+        epoch_durations.append(time.time() - epoch_t0)
+       
+        if epoch % 100 == 0 or epoch == 1 or epoch == epochs:
+            print(f"Epoch [{epoch}/{epochs}] loss={avg_loss:.10f}")
+        
+        # ============================================================
+        # 🔍 训练中监控梯度冲突（每20个epoch）
+        # ============================================================
+        if epoch % 20 == 0 and epoch > 0:
+            print(f"\n🔍 Epoch {epoch}: 监控梯度冲突...")
+            
+            monitor_metrics = monitor_gradient_conflict_during_training(
+                model=model,
+                wavelengths=wavelengths,
+                train_loader=diag_loader,
+                device=device,
+                num_batches=5,
+            )
+            
+            print(f"  平均相似度: {monitor_metrics['mean_similarity']:.3f}")
+            print(f"  负相似度比例: {monitor_metrics['negative_ratio']:.1%}")
+            print(f"  强冲突比例: {monitor_metrics['strong_conflict_ratio']:.1%}")
+            
+            # 如果冲突加剧，可以采取措施
+            if monitor_metrics['negative_ratio'] > 0.5:
+                print("  ⚠️  冲突加剧，降低学习率...")
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] *= 0.8
+
+
+    total_time = time.time() - t0
+    all_losses.append(losses)
+    print(f"Training done: {num_layer} layers, time={total_time:.2f}s")
+
+    # 保存训练曲线
+    training_output_dir = RUN_ROOT / "training_analysis"
     train_logs = save_training_curves(
         losses=losses,
         epoch_durations=epoch_durations,
         out_dir=training_output_dir,
-        tag=f"staged_multiwl_m{num_modes}_L{L}_ls{layer_size}_nlayer{num_layer}_{run_tag}",
+        tag=f"multiwl_m{num_modes}_L{L}_ls{layer_size}_nlayer{num_layer}_{run_tag}",
         num_layers=num_layer,
     )
     print(f"✔ Training curves saved -> {train_logs['loss_plot']}")
-
-    # 保存阶段信息
-    save_staged_training_info(
-        stage_info, 
-        training_output_dir / f"stage_info_layers{num_layer}_{run_tag}.txt"  # 🔑 添加 run_tag
-    )
 
     # 保存checkpoint
     ckpt_dir = RUN_ROOT / "checkpoints"
@@ -983,6 +1083,42 @@ for num_layer in num_layer_option:
         },
     )
     print("✔ Checkpoint saved ->", ckpt_path)
+    print("✔ Checkpoint saved ->", ckpt_path)
+
+    # ============================================================
+    # 🔍 步骤3：训练后详细梯度分析
+    # ============================================================
+    print("\n" + "="*70)
+    print("步骤3: 训练后详细梯度分析")
+    print("="*70)
+
+    conflict_analysis = detailed_gradient_analysis_after_training(
+        model=model,
+        wavelengths=wavelengths,
+        train_loader=diag_loader,
+        device=device,
+        save_dir=RUN_ROOT / "gradient_analysis" / f"L{num_layer}_final",
+        num_batches=20,
+    )
+
+    # 保存分析结果到JSON
+    import json
+    analysis_path = RUN_ROOT / "gradient_analysis" / f"L{num_layer}_analysis.json"
+    analysis_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    with open(analysis_path, 'w') as f:
+        json.dump({
+            'num_layers': int(num_layer),
+            'wavelengths_nm': (wavelengths * 1e9).tolist(),
+            'initial_conflict': conflict_metrics,
+            'per_layer_conflict': conflict_analysis,
+        }, f, indent=2)
+
+    print(f"✔ 分析结果已保存: {analysis_path}")
+
+    # 保存相位掩模（原有代码保持不变）
+    phase_masks = extract_phase_masks_multiwl(model)
+    # ... 后续代码 ...
 
     # 保存相位掩模
     phase_masks = extract_phase_masks_multiwl(model)

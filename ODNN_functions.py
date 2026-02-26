@@ -1135,7 +1135,8 @@ def load_mmf_modes_hdf5(
     *,
     normalize: bool = True,
     plot: bool = True,
-    save_path: str | None = None,
+    save_path=None,
+
 ):
     """
     读取 HDF5/Matlab7.3 格式的多模光纤模式，并可视化每个模式的振幅与相位。
