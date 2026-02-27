@@ -104,7 +104,10 @@ lr = 1.99
 padding_ratio = 0.5
 
 # output root
-RUN_ROOT = Path(f"results/eigenmode/5nm_gap_test1_base_{base_wavelength_idx}")
+timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+# 格式: 20260226_143052
+
+RUN_ROOT = Path(f"results/eigenmode/5nm_gap_test1_base_{base_wavelength_idx}_weighted_{timestamp}")
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 # prediction viz samples

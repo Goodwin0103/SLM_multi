@@ -158,33 +158,32 @@ def train_multiwl_staged(
     verbose: bool = True,
 ) -> Dict[str, any]:
     """
-    分阶段训练多波长D2NN模型
+    多波长D2NN模型训练（所有波长同时训练 + 边缘波长加权）
     
-    训练策略：
-        - 阶段1: 只训练中心波长（base_wavelength）
-        - 阶段2: 训练相邻波长（base ± 1）
-        - 阶段3: 训练扩展范围（base ± 2）
-        - 阶段4: 训练所有波长
+    训练策略（已修改）：
+        - 所有波长在每个epoch都进行训练
+        - 边缘波长获得更高的损失权重
+        - 不再使用分阶段训练（避免模式坍缩）
     
     Args:
         model: D2NNModelMultiWL 模型实例
         train_datasets_per_wl: 每个波长的训练数据集列表，长度为 L
         wavelengths: 波长数组 (L,)，单位：米
-        base_wavelength_idx: 基准波长索引（通常是中心波长）
+        base_wavelength_idx: 基准波长索引（用于确定权重分布）
         epochs: 总训练轮数
         batch_size: 批次大小
         lr: 初始学习率
         device: 训练设备
         seed: 随机种子
         scheduler_gamma: 学习率衰减因子
-        stage_ratios: 每个阶段的epoch比例，默认 [0.25, 0.25, 0.25, 0.25]
+        stage_ratios: （已废弃，保留以兼容旧代码）
         verbose: 是否打印详细信息
     
     Returns:
         包含训练历史的字典：
             - losses: 每个epoch的损失列表
             - epoch_durations: 每个epoch的训练时间列表
-            - stage_info: 每个阶段的信息
+            - stage_info: 阶段信息（为兼容性保留，实际只有1个阶段）
             - total_time: 总训练时间
             - final_loss: 最终损失
     
@@ -215,30 +214,43 @@ def train_multiwl_staged(
     if len(train_datasets_per_wl) != L:
         raise ValueError(f"Expected {L} datasets, got {len(train_datasets_per_wl)}")
     
-    # 默认阶段比例
-    if stage_ratios is None:
-        stage_ratios = [0.25, 0.25, 0.25, 0.25]
+    # 🔑 定义波长权重（边缘波长权重更高）
+    wl_weights = torch.ones(L, device=device, dtype=torch.float32)
     
-    if not np.isclose(sum(stage_ratios), 1.0):
-        raise ValueError(f"stage_ratios must sum to 1.0, got {sum(stage_ratios)}")
+    # 根据波长位置分配权重
+    for i in range(L):
+        distance_from_edge = min(i, L - 1 - i)  # 距离最近边缘的距离
+        
+        if distance_from_edge == 0:  # 最边缘
+            wl_weights[i] = 0.8  # 边缘波长权重较高
+        elif distance_from_edge == 1:  # 次边缘
+            wl_weights[i] = 1.1  # 次边缘波长权重适中        
+        elif distance_from_edge == 2:  
+            wl_weights[i] = 1.1  
+        else:  # 中心区域
+            wl_weights[i] = 1.1
+    
+    # 归一化权重（可选，使平均权重为1）
+    wl_weights = wl_weights / wl_weights.mean()
+    
+    if verbose:
+        print(f"\n{'='*70}")
+        print(f"Multi-Wavelength Training (Balanced Strategy)")
+        print(f"{'='*70}")
+        print(f"Training strategy: All wavelengths simultaneously")
+        print(f"Edge wavelength weighting: ENABLED")
+        print(f"\nWavelength weights:")
+        for i in range(L):
+            print(f"  λ={wavelengths[i]*1e9:.1f} nm: weight={wl_weights[i].item():.2f}")
+        print(f"{'='*70}\n")
     
     # 优化器和调度器
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = ExponentialLR(optimizer, gamma=scheduler_gamma)
     
-    # 定义训练阶段
-    training_stages = _define_training_stages(
-        L=L,
-        base_idx=base_idx,
-        epochs=epochs,
-        stage_ratios=stage_ratios,
-        wavelengths=wavelengths,
-    )
-    
     # 训练历史
     losses: List[float] = []
     epoch_durations: List[float] = []
-    stage_info: List[Dict] = []
     
     # 随机数生成器
     g = torch.Generator()
@@ -246,81 +258,61 @@ def train_multiwl_staged(
     
     # 开始训练
     t_start = time.time()
-    total_epoch_count = 0
     
-    for stage_idx, stage in enumerate(training_stages):
-        stage_name = stage['name']
-        active_wl_indices = stage['wl_indices']
-        stage_epochs = stage['epochs']
+    for epoch in range(1, epochs + 1):
+        epoch_t0 = time.time()
         
-        if verbose:
-            print(f"\n{'='*70}")
-            print(f"{stage_name} (Stage {stage_idx+1}/{len(training_stages)})")
-            print(f"Training wavelengths: {[wavelengths[i]*1e9 for i in active_wl_indices]} nm")
-            print(f"Epochs: {total_epoch_count+1} - {total_epoch_count+stage_epochs}")
-            print(f"{'='*70}")
+        # 🔑 训练一个epoch（所有波长）
+        epoch_loss = _train_one_epoch_multiwl_weighted(
+            model=model,
+            train_datasets_per_wl=train_datasets_per_wl,
+            wl_weights=wl_weights,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            device=device,
+            batch_size=batch_size,
+            L=L,
+            generator=g,
+        )
         
-        stage_t_start = time.time()
-        stage_losses = []
+        losses.append(epoch_loss)
         
-        for epoch in range(1, stage_epochs + 1):
-            epoch_t0 = time.time()
-            
-            # 训练一个epoch
-            epoch_loss = _train_one_epoch_multiwl(
-                model=model,
-                train_datasets_per_wl=train_datasets_per_wl,
-                active_wl_indices=active_wl_indices,
-                optimizer=optimizer,
-                device=device,
-                batch_size=batch_size,
-                L=L,
-                generator=g,
-            )
-            
-            scheduler.step()
-            losses.append(epoch_loss)
-            stage_losses.append(epoch_loss)
-            
-            # 同步GPU
-            if device.type == "cuda":
-                torch.cuda.synchronize(device)
-            
-            epoch_duration = time.time() - epoch_t0
-            epoch_durations.append(epoch_duration)
-            
-            # 打印进度
-            if verbose and (epoch % 50 == 0 or epoch == 1 or epoch == stage_epochs):
-                print(f"  Epoch [{total_epoch_count+epoch}/{total_epoch_count+stage_epochs}] "
-                      f"loss={epoch_loss:.10f} time={epoch_duration:.2f}s")
+        # 同步GPU
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
         
-        stage_duration = time.time() - stage_t_start
-        total_epoch_count += stage_epochs
+        epoch_duration = time.time() - epoch_t0
+        epoch_durations.append(epoch_duration)
         
-        # 记录阶段信息
-        stage_info.append({
-            'stage_idx': stage_idx,
-            'name': stage_name,
-            'wl_indices': active_wl_indices,
-            'wavelengths_nm': [wavelengths[i]*1e9 for i in active_wl_indices],
-            'epochs': stage_epochs,
-            'avg_loss': float(np.mean(stage_losses)),
-            'final_loss': stage_losses[-1],
-            'duration_sec': stage_duration,
-        })
-        
-        if verbose:
-            print(f"✔ {stage_name} completed: avg_loss={np.mean(stage_losses):.10f}, "
-                  f"time={stage_duration:.2f}s")
+        # 打印进度
+        if verbose and (epoch % 50 == 0 or epoch == 1 or epoch == epochs):
+            current_lr = optimizer.param_groups[0]['lr']
+            print(f"  Epoch [{epoch}/{epochs}] "
+                  f"loss={epoch_loss:.10f} "
+                  f"lr={current_lr:.6f} "
+                  f"time={epoch_duration:.2f}s")
     
     total_time = time.time() - t_start
     
     if verbose:
         print(f"\n{'='*70}")
-        print(f"✅ Staged training completed!")
+        print(f"✅ Training completed!")
         print(f"Total time: {total_time:.2f}s ({total_time/60:.2f} min)")
         print(f"Final loss: {losses[-1]:.10f}")
         print(f"{'='*70}")
+    
+    # 🔑 为兼容性创建单阶段信息
+    stage_info = [{
+        'stage_idx': 0,
+        'name': 'All wavelengths (weighted)',
+        'wl_indices': list(range(L)),
+        'wavelengths_nm': [wavelengths[i]*1e9 for i in range(L)],
+        'epochs': epochs,
+        'avg_loss': float(np.mean(losses)),
+        'final_loss': losses[-1],
+        'duration_sec': total_time,
+        'weights': wl_weights.cpu().numpy().tolist(),
+    }]
     
     return {
         'losses': losses,
@@ -330,6 +322,87 @@ def train_multiwl_staged(
         'final_loss': losses[-1],
     }
 
+
+def _train_one_epoch_multiwl_weighted(
+    model: torch.nn.Module,
+    train_datasets_per_wl: List[torch.utils.data.TensorDataset],
+    wl_weights: torch.Tensor,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler._LRScheduler,
+    device: torch.device,
+    batch_size: int,
+    L: int,
+    generator: torch.Generator,
+) -> float:
+    """
+    训练一个epoch（所有波长 + 加权损失）
+    
+    Args:
+        model: 模型
+        train_datasets_per_wl: 每个波长的数据集
+        wl_weights: 波长权重张量 (L,)
+        optimizer: 优化器
+        scheduler: 学习率调度器
+        device: 设备
+        batch_size: 批次大小
+        L: 总波长数
+        generator: 随机数生成器
+    
+    Returns:
+        该epoch的平均损失（未加权）
+    """
+    from torch.utils.data import DataLoader
+    import torch.nn.functional as F
+    
+    model.train()
+    epoch_loss = 0.0
+    batch_count = 0
+    
+    # 🔑 遍历所有波长
+    for wl_idx in range(L):
+        train_loader_wl = DataLoader(
+            train_datasets_per_wl[wl_idx],
+            batch_size=batch_size,
+            shuffle=True,
+            generator=generator,
+        )
+        
+        for batch in train_loader_wl:
+            if len(batch) == 3:
+                images, label_img, amp = batch
+            else:
+                images, label_img = batch
+            
+            images = images.to(device, dtype=torch.complex64, non_blocking=True)
+            label_img = label_img.to(device, dtype=torch.float32, non_blocking=True)
+            
+            # 确保输入维度正确
+            if images.ndim == 3:
+                images = images.unsqueeze(1)  # (B, 1, H, W)
+            
+            # 复制到所有波长通道
+            x = images.repeat(1, L, 1, 1).contiguous()  # (B, L, H, W)
+            
+            # 前向传播
+            optimizer.zero_grad(set_to_none=True)
+            I_blhw = model(x)  # (B, L, H, W)
+            
+            # 🔑 计算加权损失
+            loss = F.mse_loss(I_blhw[:, wl_idx], label_img[:, 0])
+            weighted_loss = loss * wl_weights[wl_idx]
+            
+            # 反向传播
+            weighted_loss.backward()
+            optimizer.step()
+            
+            # 记录未加权的损失（用于监控）
+            epoch_loss += float(loss.item())
+            batch_count += 1
+    
+    # 学习率衰减
+    scheduler.step()
+    
+    return epoch_loss / max(1, batch_count)
 
 def _define_training_stages(
     L: int,
