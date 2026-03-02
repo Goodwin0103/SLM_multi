@@ -36,6 +36,8 @@ from odnn_multiwl_model import D2NNModelMultiWL
 
 from odnn_training_io import train_multiwl_staged, print_stage_summary, save_staged_training_info
 
+from odnn_training_visualization import visualize_phase_masks
+
 # ============================================================
 # Reproducibility / device
 # ============================================================
@@ -58,7 +60,7 @@ print("Using Device:", device)
 # Parameters
 # ============================================================
 field_size = 25
-layer_size = 200
+layer_size = 110
 num_modes = 3
 
 circle_focus_radius = 5
@@ -76,21 +78,21 @@ num_superposition_train_samples = 100
 superposition_eval_seed = 20240116
 superposition_train_seed = 20240115
 
-num_layer_option = [2, 3, 4, 5, 6, 7, 8, 9, 10]
+num_layer_option = [1, 2, 3, 4, 5]
 # num_layer_option = [7 ]
 
-# geometry / propagation params
-z_layers = 40e-6
-pixel_size = 1e-6
-z_prop = 120e-6
-z_input_to_first = 40e-6
+# SLM
+z_layers = 49.465e-3
+pixel_size = 12.5e-6
+z_prop = 20e-2
+z_input_to_first = 0
 
 # wavelengths (MultiWL)
-# wavelengths = np.array([1550e-9, 1568e-9, 1650e-9], dtype=np.float32)
+wavelengths = np.array([532e-9, 650e-9], dtype=np.float32)
 # wavelengths = np.array([1530e-9, 1540e-9, 1550e-9, 1560e-9], dtype=np.float32)
 # wavelengths = np.array([1530e-9, 1535e-9, 1540e-9], dtype=np.float32)
-wavelengths = np.array([1530e-9, 1535e-9, 1540e-9, 1545e-9, 1550e-9, 1555e-9, 1560e-9, 1565e-9], dtype=np.float32)
-base_wavelength_idx = 4
+# wavelengths = np.array([1530e-9, 1535e-9, 1540e-9, 1545e-9, 1550e-9, 1555e-9, 1560e-9, 1565e-9], dtype=np.float32)
+base_wavelength_idx = 1
 L = int(len(wavelengths))
 
 # data options
@@ -107,7 +109,7 @@ padding_ratio = 0.5
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 # 格式: 20260226_143052
 
-RUN_ROOT = Path(f"results/eigenmode/5nm_gap_test1_base_{base_wavelength_idx}_weighted_{timestamp}")
+RUN_ROOT = Path(f"results/eigenmode/532_650_base_{base_wavelength_idx}_weighted_{timestamp}")
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 # prediction viz samples
@@ -125,10 +127,20 @@ def generate_detector_patterns_multiwl(
     num_wavelengths: int,
     radius: int,
     pattern_mode: str = "circle",
-    show_debug: bool = False
+    show_debug: bool = False,
+    margin_ratio: float = 0.25,  # 🆕 新增参数：边距比例（默认25%）
 ) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
     """
-    生成多波长标签图案
+    生成多波长标签图案（更集中的布局）
+    
+    Args:
+        H, W: 图像尺寸
+        num_modes: 模式数
+        num_wavelengths: 波长数
+        radius: 标签半径
+        pattern_mode: 图案模式
+        show_debug: 是否显示调试图
+        margin_ratio: 边距比例（0.0-0.5），值越大标签越集中
     
     Returns:
         patterns: (H, W, num_modes * num_wavelengths)
@@ -136,22 +148,30 @@ def generate_detector_patterns_multiwl(
     """
     total_labels = num_modes * num_wavelengths
     
-    # ===== 新布局：每个 mode 一行，每个波长一列（从左到右递增）=====
+    # ===== 新布局：每个 mode 一行，每个波长一列 =====
     num_rows = num_modes
     num_cols = num_wavelengths
 
-    margin = radius + 3  # 边界留白，可调
-    xs = np.linspace(margin, W - 1 - margin, num_cols)
-    ys = np.linspace(margin, H - 1 - margin, num_rows)
+    # 🔑 关键修改：使用比例边距，使标签更集中
+    margin_x = int(W * margin_ratio)  # 水平边距
+    margin_y = int(H * margin_ratio)  # 垂直边距
+    
+    # 确保边距至少能容纳标签
+    min_margin = radius + 5
+    margin_x = max(margin_x, min_margin)
+    margin_y = max(margin_y, min_margin)
+    
+    # 在缩小的区域内均匀分布
+    xs = np.linspace(margin_x, W - 1 - margin_x, num_cols)
+    ys = np.linspace(margin_y, H - 1 - margin_y, num_rows)
 
-    # centers 顺序必须保持：idx = mode * L + wl（mode-major）
+    # centers 顺序：idx = mode * L + wl（mode-major）
     centers = []
     for mode_idx in range(num_rows):
         for wl_idx in range(num_cols):
             cx = int(round(xs[wl_idx]))
             cy = int(round(ys[mode_idx]))
             centers.append((cy, cx))
-
     
     # 生成图案
     if pattern_mode == "circle":
@@ -180,7 +200,15 @@ def generate_detector_patterns_multiwl(
             wl_idx = idx % num_wavelengths
             ax.text(cx, cy, f"M{mode_idx}W{wl_idx}", 
                    ha='center', va='center', color='red', fontsize=8)
-        plt.title(f"MultiWL Labels: {num_modes} modes × {num_wavelengths} wavelengths")
+        
+        # 🆕 显示边距信息
+        ax.axvline(margin_x, color='cyan', linestyle='--', linewidth=1, alpha=0.5)
+        ax.axvline(W - margin_x, color='cyan', linestyle='--', linewidth=1, alpha=0.5)
+        ax.axhline(margin_y, color='cyan', linestyle='--', linewidth=1, alpha=0.5)
+        ax.axhline(H - margin_y, color='cyan', linestyle='--', linewidth=1, alpha=0.5)
+        
+        plt.title(f"MultiWL Labels: {num_modes} modes × {num_wavelengths} wavelengths\n"
+                 f"Margin: {margin_ratio*100:.0f}% ({margin_x}×{margin_y} pixels)")
         plt.savefig(RUN_ROOT / "debug_multiwl_labels.png", dpi=150)
         plt.close()
         print(f"✔ Debug label layout saved -> {RUN_ROOT / 'debug_multiwl_labels.png'}")
@@ -699,7 +727,7 @@ def build_mode_context(base_modes: np.ndarray, num_modes: int) -> dict:
 # ============================================================
 # Load eigenmodes
 # ============================================================
-eigenmodes_OM4 = load_complex_modes_from_mat("mmf_103modes_25_PD_1.15.mat", key="modes_field")
+eigenmodes_OM4 = load_complex_modes_from_mat("mmf_6modes_25_PD_1.15.mat", key="modes_field")
 print("Loaded modes shape:", eigenmodes_OM4.shape, "dtype:", eigenmodes_OM4.dtype)
 
 mode_context = build_mode_context(eigenmodes_OM4, num_modes)
@@ -995,7 +1023,17 @@ for num_layer in num_layer_option:
         pm_mat = pm_dir / "phase_masks.mat"
         savemat(str(pm_mat), {"phase_masks": np.stack(phase_masks, axis=0).astype(np.float32)})
         print(f"✔ Phase masks saved -> {pm_mat}")
-
+    # 🆕 生成 PNG 可视化（每层单独一张图）
+    png_paths = visualize_phase_masks(
+        phase_masks,
+        out_dir=pm_dir,
+        base_name=f"phase_mask_L{num_layer}",
+        save_degree=False,  # 保存弧度（或改为 True 显示角度）
+        dpi=300,
+        cmap="twilight",  # 适合相位的色图
+        show_stats=True,
+    )
+    print(f"✔ Generated {len(png_paths)} phase mask PNGs -> {pm_dir}")
     # 预测可视化
     diag_dir = RUN_ROOT / "prediction_viz" / f"L{num_layer}_{run_tag}"
     n_vis = min(num_pred_diag_samples, len(test_datasets_per_wl[0]))

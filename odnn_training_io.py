@@ -222,13 +222,13 @@ def train_multiwl_staged(
         distance_from_edge = min(i, L - 1 - i)  # 距离最近边缘的距离
         
         if distance_from_edge == 0:  # 最边缘
-            wl_weights[i] = 0.8  # 边缘波长权重较高
+            wl_weights[i] = 1.0  # 边缘波长权重较高
         elif distance_from_edge == 1:  # 次边缘
-            wl_weights[i] = 1.1  # 次边缘波长权重适中        
+            wl_weights[i] = 1.0  # 次边缘波长权重适中        
         elif distance_from_edge == 2:  
-            wl_weights[i] = 1.1  
+            wl_weights[i] = 1.0  
         else:  # 中心区域
-            wl_weights[i] = 1.1
+            wl_weights[i] = 1.0
     
     # 归一化权重（可选，使平均权重为1）
     wl_weights = wl_weights / wl_weights.mean()

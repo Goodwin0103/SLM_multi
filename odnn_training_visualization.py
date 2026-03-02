@@ -1688,3 +1688,104 @@ def capture_eigenmode_propagation_multiwl(
     )
 
     return {"fig_path": str(fig_path), "mat_path": str(mat_path)}
+
+def visualize_phase_masks(
+    phase_masks: list[np.ndarray],
+    out_dir: Path | str,
+    base_name: str = "phase_mask",
+    save_degree: bool = False,
+    dpi: int = 300,
+    cmap: str = "twilight",
+    show_stats: bool = True,
+) -> list[Path]:
+    """
+    为每层 phase mask 生成 PNG 可视化。
+    
+    Parameters
+    ----------
+    phase_masks : list[np.ndarray]
+        每层的相位掩模列表
+    out_dir : Path | str
+        输出目录
+    base_name : str
+        文件名前缀
+    save_degree : bool
+        是否转换为角度显示
+    dpi : int
+        图像分辨率
+    cmap : str
+        色图名称（推荐: "twilight", "hsv", "twilight_shifted"）
+    show_stats : bool
+        是否显示统计信息
+    
+    Returns
+    -------
+    png_paths : list[Path]
+        保存的 PNG 文件路径列表
+    """
+    import matplotlib.pyplot as plt
+    
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    
+    png_paths = []
+    
+    for layer_idx, mask in enumerate(phase_masks, start=1):
+        # 转换单位
+        if save_degree:
+            mask_display = np.rad2deg(mask)
+            unit = "degrees"
+            vmin, vmax = 0, 360
+        else:
+            mask_display = mask
+            unit = "radians"
+            vmin, vmax = 0, 2 * np.pi
+        
+        # 创建图形
+        fig, ax = plt.subplots(figsize=(8, 7))
+        
+        # 显示相位掩模
+        im = ax.imshow(mask_display, cmap=cmap, aspect='auto', vmin=vmin, vmax=vmax)
+        
+        # 色条
+        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+        cbar.set_label(f'Phase ({unit})', fontsize=11)
+        
+        # 标题
+        ax.set_title(
+            f"Phase Mask - Layer {layer_idx}", 
+            fontsize=13, 
+            fontweight='bold',
+            pad=15
+        )
+        ax.set_xlabel("X (pixels)", fontsize=10)
+        ax.set_ylabel("Y (pixels)", fontsize=10)
+        
+        # 统计信息
+        if show_stats:
+            stats_text = (
+                f"Shape: {mask.shape[0]}×{mask.shape[1]}\n"
+                f"Min: {mask_display.min():.3f} {unit}\n"
+                f"Max: {mask_display.max():.3f} {unit}\n"
+                f"Mean: {mask_display.mean():.3f} {unit}\n"
+                f"Std: {mask_display.std():.3f} {unit}"
+            )
+            ax.text(
+                0.02, 0.98, stats_text,
+                transform=ax.transAxes,
+                fontsize=9,
+                verticalalignment='top',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='gray')
+            )
+        
+        # 保存
+        png_filename = f"{base_name}_layer{layer_idx}.png"
+        png_path = out_dir / png_filename
+        fig.tight_layout()
+        fig.savefig(png_path, dpi=dpi, bbox_inches='tight')
+        plt.close(fig)
+        
+        png_paths.append(png_path)
+        print(f"✔ Saved phase mask visualization -> {png_path}")
+    
+    return png_paths
