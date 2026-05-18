@@ -1689,6 +1689,160 @@ def capture_eigenmode_propagation_multiwl(
 
     return {"fig_path": str(fig_path), "mat_path": str(mat_path)}
 
+@torch.no_grad()
+def save_mode_triptych_multiwl(
+    model: torch.nn.Module,
+    mode_index: int,
+    eigenmode_field: torch.Tensor,
+    label_field: torch.Tensor,
+    *,
+    layer_size: int,
+    wavelengths: np.ndarray,
+    output_dir: str | Path,
+    tag: str,
+    evaluation_regions: Sequence[Tuple[int, int, int, int]] | None = None,
+    detect_radius: int | None = None,
+    show_mask_overlays: bool = False,
+    overlay_on_input: bool = False,          # 默认 Input 不画圈
+    base_wavelength_idx: int = 0,            # 总览图里用哪一个 λ
+    per_wavelength_figs: bool = True,        # 是否另外给每个 λ 单独存一张三联图
+    per_wavelength_label: bool = False,      # 是否对每个 λ 的 label 也做缩放（默认共享同一 label）
+) -> dict[str, object]:
+    """
+    Multi-wavelength triptych for one eigenmode.
+    - Saves a 'grid' figure: rows = wavelengths, columns = [Input, Output, Label]
+    - Optionally saves per-wavelength 3-panel PNG (same style as save_mode_triptych)
+    - Exports a MAT file with per-λ input/output intensities and label.
+    """
+    device = next(model.parameters()).device
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    was_training = model.training
+    model.eval()
+
+    # ---- input: (H,W) -> padded -> (1,L,H,W)
+    plane_hw = eigenmode_field.to(device=device, dtype=torch.complex64)
+    padded_field = pad_field_to_layer(plane_hw, layer_size)       # (H,W)
+    H, W = int(padded_field.shape[-2]), int(padded_field.shape[-1])
+    L = int(len(wavelengths))
+
+    input_batch = padded_field[None, None, ...].repeat(1, L, 1, 1).contiguous()  # (1,L,H,W)
+
+    # ---- forward (assumes D2NNModelMultiWL that takes (1,L,H,W) complex and returns intensity)
+    out = model(input_batch)                                       # (1,L,H,W) or (L,H,W)
+    if out.ndim == 4:
+        output_intensity = out[0].detach().cpu().numpy().astype(np.float32)  # (L,H,W)
+    else:
+        output_intensity = out.detach().cpu().numpy().astype(np.float32)      # (L,H,W)
+
+    # per-λ input intensity (for eigenmode input, all λ share the same amp^2)
+    input_intensity = (torch.abs(padded_field) ** 2).detach().cpu().numpy().astype(np.float32)  # (H,W)
+
+    # label
+    label_np = label_field.detach().cpu().numpy().astype(np.float32)                             # (H,W)
+
+    wls_nm = np.asarray(wavelengths, dtype=np.float64) * 1e9
+    base_idx = int(np.clip(base_wavelength_idx, 0, L - 1))
+
+    # ---------- (A) GRID figure: rows = wavelengths, cols = [Input, Output, Label] ----------
+    fig, axes = plt.subplots(L, 3, figsize=(12, 4 * L), squeeze=False)
+    for li in range(L):
+        vmax = float(max(
+            input_intensity.max(),
+            output_intensity[li].max(),
+            label_np.max(),
+            1e-8,
+        ))
+
+        im0 = axes[li, 0].imshow(input_intensity, cmap="inferno", vmin=0, vmax=vmax)
+        axes[li, 0].set_title(f"Mode {mode_index+1} Input | λ={wls_nm[li]:.1f} nm")
+        axes[li, 0].axis("off")
+        if show_mask_overlays and overlay_on_input:
+            _overlay_detector_masks(axes[li, 0], evaluation_regions, detect_radius)
+
+        im1 = axes[li, 1].imshow(output_intensity[li], cmap="inferno", vmin=0, vmax=vmax)
+        axes[li, 1].set_title(f"Model Output | λ={wls_nm[li]:.1f} nm")
+        axes[li, 1].axis("off")
+        if show_mask_overlays:
+            _overlay_detector_masks(axes[li, 1], evaluation_regions, detect_radius)
+
+        im2 = axes[li, 2].imshow(label_np, cmap="inferno", vmin=0, vmax=vmax)
+        axes[li, 2].set_title("Label")
+        axes[li, 2].axis("off")
+        if show_mask_overlays:
+            _overlay_detector_masks(axes[li, 2], evaluation_regions, detect_radius)
+
+        for ax, im in zip(axes[li], [im0, im1, im2]):
+            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    grid_fig_path = output_dir / f"mode{mode_index+1}_{tag}_multiwl_grid.png"
+    plt.savefig(grid_fig_path, dpi=300)
+    plt.close(fig)
+
+    # ---------- (B) Per-wavelength individual triptychs ----------
+    per_wl_fig_paths: list[str] = []
+    if per_wavelength_figs:
+        per_wl_dir = output_dir / "per_wavelength"
+        per_wl_dir.mkdir(parents=True, exist_ok=True)
+        for li in range(L):
+            vmax = float(max(input_intensity.max(),
+                             output_intensity[li].max(),
+                             label_np.max(), 1e-8))
+            fig2, ax2 = plt.subplots(1, 3, figsize=(12, 4))
+            im0 = ax2[0].imshow(input_intensity, cmap="inferno", vmin=0, vmax=vmax)
+            ax2[0].set_title(f"Mode {mode_index+1} Input | λ={wls_nm[li]:.1f} nm")
+            ax2[0].axis("off")
+            if show_mask_overlays and overlay_on_input:
+                _overlay_detector_masks(ax2[0], evaluation_regions, detect_radius)
+
+            im1 = ax2[1].imshow(output_intensity[li], cmap="inferno", vmin=0, vmax=vmax)
+            ax2[1].set_title(f"Model Output | λ={wls_nm[li]:.1f} nm")
+            ax2[1].axis("off")
+            if show_mask_overlays:
+                _overlay_detector_masks(ax2[1], evaluation_regions, detect_radius)
+
+            im2 = ax2[2].imshow(label_np, cmap="inferno", vmin=0, vmax=vmax)
+            ax2[2].set_title("Label")
+            ax2[2].axis("off")
+            if show_mask_overlays:
+                _overlay_detector_masks(ax2[2], evaluation_regions, detect_radius)
+
+            for ax, im in zip(ax2, [im0, im1, im2]):
+                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+            plt.tight_layout()
+            p = per_wl_dir / f"mode{mode_index+1}_{tag}_l{li:02d}_{wls_nm[li]:.1f}nm.png"
+            plt.savefig(p, dpi=300)
+            plt.close(fig2)
+            per_wl_fig_paths.append(str(p))
+
+    # ---------- (C) MAT export ----------
+    mat_path = output_dir / f"mode{mode_index+1}_{tag}_multiwl.mat"
+    savemat(
+        str(mat_path),
+        {
+            "mode_index": np.array([mode_index + 1], dtype=np.int32),
+            "input_field": padded_field.detach().cpu().numpy().astype(np.complex64),  # (H,W)
+            "input_intensity": input_intensity,                                        # (H,W)
+            "model_output": output_intensity,                                          # (L,H,W)
+            "label": label_np,                                                         # (H,W)
+            "wavelengths_m": np.asarray(wavelengths, dtype=np.float64),
+            "base_wavelength_idx": np.array([base_idx], dtype=np.int32),
+            "layer_size": np.array([layer_size], dtype=np.int32),
+        },
+    )
+
+    if was_training:
+        model.train()
+
+    return {
+        "grid_fig_path": str(grid_fig_path),
+        "per_wavelength_figs": per_wl_fig_paths,
+        "mat_path": str(mat_path),
+    }
+
 def visualize_phase_masks(
     phase_masks: list[np.ndarray],
     out_dir: Path | str,

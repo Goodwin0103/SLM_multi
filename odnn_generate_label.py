@@ -229,7 +229,7 @@ def main():
 
     current_path = os.getcwd()
     print("Current Working Directory:", current_path)
-    mat_path = os.path.join(current_path, "mmf_6modes_25_PD_1.15.mat")
+    mat_path = os.path.join(current_path, "mmf_20_25_PD_1.15.mat")
     figure_output_dir = os.path.join(current_path, "generated_figures")
     os.makedirs(figure_output_dir, exist_ok=True)
 

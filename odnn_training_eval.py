@@ -1145,13 +1145,14 @@ def evaluate_spot_metrics_multiwl_each(
     # - So here we wrap the model so that model(x) returns (B,1,H,W) for the chosen wl,
     #   and we also make the wrapper still look "multiwl" via .propagation.wavelengths existing.
     for wl_idx in range(L):
+        own_regions = [evaluation_regions[k * L + wl_idx] for k in range(num_modes)]
         picker = _PickWL(model, wl_idx).to(device)
         picker.eval()
 
         m = evaluate_spot_metrics(
             picker,
             test_loader,
-            evaluation_regions,
+            own_regions,
             detect_radius=detect_radius,
             device=device,
             pred_case=pred_case,
