@@ -1480,12 +1480,14 @@ def capture_eigenmode_propagation_multiwl(
     base_wavelength_idx: int = 0,
     fractions_between_layers: Sequence[Sequence[float]] | None = None,
     output_fractions: Sequence[float] | None = None,
-) -> dict[str, str]:
+) -> dict[str, object]:
     """
     MultiWL version (dense snapshots supported):
     - records: input, arrival before L1, per-layer propagation snapshots, after last layer, output plane
     - figure: show base_wavelength_idx only (to avoid huge figure)
     - mat: save ALL wavelengths complex fields/intensities: fields(K,L,H,W)
+    - NEW: also computes & plots remaining energy at each LAYER plane (per-λ + total),
+           and saves the values into the .mat file.
     """
     device = next(model.parameters()).device
     model.eval()
@@ -1508,13 +1510,12 @@ def capture_eigenmode_propagation_multiwl(
 
     num_layers = len(layers)
     if fractions_between_layers is None:
-        # mimic your single-wl defaults: internal points for each layer segment, last can be ()
         default: list[tuple[float, ...]] = []
         for li in range(num_layers):
             if li < num_layers - 1:
                 default.append((1.0 / 3.0, 2.0 / 3.0))
             else:
-                default.append((1.0 / 3.0, 2.0 / 3.0))  # last layer segment too (feel free to make () )
+                default.append((1.0 / 3.0, 2.0 / 3.0))
         fractions_between_layers = tuple(default)
 
     if output_fractions is None:
@@ -1544,7 +1545,6 @@ def capture_eigenmode_propagation_multiwl(
         stage_label: str,
         z_base: float,
     ) -> torch.Tensor:
-        # use sorted unique fractions within (0,1)
         fr = [float(f) for f in fractions]
         fr = [f for f in fr if 0.0 < f < 1.0]
         fr = sorted(set(fr))
@@ -1579,13 +1579,12 @@ def capture_eigenmode_propagation_multiwl(
     # layers: (mask) + (prop with snapshots)
     # ----------------------------
     for li, layer in enumerate(layers):
-        # apply scaled mask (same as your multiwl layer)
         lam0 = layer.lam0.to(device=device)
         wl_buf = layer.wavelengths.to(device=device)
         scale = (lam0 / wl_buf)  # (L,)
 
         phi0 = layer.phase.to(device=device, dtype=torch.float32)      # (H,W)
-        phi = phi0[None, :, :] * scale[:, None, None]                 # (L,H,W)
+        phi = phi0[None, :, :] * scale[:, None, None]                  # (L,H,W)
         phase_c = torch.exp(1j * phi).to(torch.complex64)              # (L,H,W)
 
         field = field * phase_c[None, ...]
@@ -1628,11 +1627,15 @@ def capture_eigenmode_propagation_multiwl(
     # detector intensity (full L)
     output_intensity = (field.abs() ** 2)[0].detach().cpu().numpy().astype(np.float32)  # (L,H,W)
 
-    # --- overview figure using base_wavelength_idx only
+    # =========================================================
+    # Overview figure (base wavelength only) — unchanged
+    # =========================================================
     base_idx = int(np.clip(base_wavelength_idx, 0, L - 1))
-    intensity_stack_base = np.stack([np.abs(r["field"][base_idx]) ** 2 for r in records], axis=0)  # (K,H,W)
+    intensity_stack_base = np.stack([np.abs(r["field"][base_idx]) ** 2 for r in records], axis=0)
     vmax = float(np.percentile(intensity_stack_base, 99.5))
-    vmax = vmax if np.isfinite(vmax) and vmax > 0 else float(np.max(intensity_stack_base) if intensity_stack_base.size else 1.0)
+    vmax = vmax if np.isfinite(vmax) and vmax > 0 else float(
+        np.max(intensity_stack_base) if intensity_stack_base.size else 1.0
+    )
 
     K = len(records)
     ncols = 4
@@ -1657,7 +1660,78 @@ def capture_eigenmode_propagation_multiwl(
     fig.savefig(fig_path, dpi=300)
     plt.close(fig)
 
-    # --- MAT export (store all L)
+    # =========================================================
+    # NEW: energy at each LAYER plane
+    # Only pick layer planes: input / arrive_Lk / after_last_layer / output_plane
+    # =========================================================
+    wanted_keys = ["input"] \
+                + [f"arrive_L{k+1}" for k in range(num_layers)] \
+                + ["after_last_layer", "output_plane"]
+
+    plane_records: list[dict[str, Any]] = []
+    for k in wanted_keys:
+        for r in records:
+            if r["key"] == k:
+                plane_records.append(r)
+                break
+
+    # per-λ + total energy
+    energy_planes_per_wl = np.stack(
+        [(np.abs(r["field"]) ** 2).reshape(L, -1).sum(axis=1) for r in plane_records],
+        axis=0,
+    ).astype(np.float64)                                          # (Nplanes, L)
+    energy_planes_total = energy_planes_per_wl.sum(axis=1)         # (Nplanes,)
+
+    # normalize to input
+    E0_wl = energy_planes_per_wl[0].copy()
+    E0_total = float(energy_planes_total[0])
+    E0_wl_safe = np.where(E0_wl > 0, E0_wl, 1.0)
+    energy_planes_per_wl_norm = energy_planes_per_wl / E0_wl_safe[None, :]
+    energy_planes_total_norm = energy_planes_total / (E0_total if E0_total > 0 else 1.0)
+
+    plane_keys = [r["key"] for r in plane_records]
+    plane_z_m = np.array([r["z"] for r in plane_records], dtype=np.float64)
+    wls_nm = (np.asarray(wavelengths, dtype=np.float64) * 1e9)
+
+    # plot
+    fig_e, ax_e = plt.subplots(figsize=(max(7.0, 0.9 * len(plane_keys)), 4.5))
+    xs = np.arange(len(plane_keys))
+    for li in range(L):
+        ax_e.plot(
+            xs, energy_planes_per_wl_norm[:, li],
+            marker="o", label=f"λ={wls_nm[li]:.1f} nm",
+        )
+    ax_e.plot(
+        xs, energy_planes_total_norm,
+        marker="s", linestyle="--", color="k", label="total (sum λ)",
+    )
+    ax_e.set_xticks(xs)
+    ax_e.set_xticklabels(plane_keys, rotation=30, ha="right", fontsize=8)
+    ax_e.set_ylabel("Energy (normalized to input)")
+    ax_e.set_title(f"Energy at each layer plane | mode {mode_index+1}")
+    ax_e.grid(True, alpha=0.3)
+    ax_e.set_ylim(bottom=0.0)
+    ax_e.legend(fontsize=9, loc="best")
+    fig_e.tight_layout()
+    energy_fig_path = output_dir / f"energy_at_layers_mode{mode_index+1}_{tag}.png"
+    fig_e.savefig(energy_fig_path, dpi=250, bbox_inches="tight")
+    plt.close(fig_e)
+
+    # console table
+    print(f"\n[Energy at each plane | mode {mode_index+1} | tag={tag}]")
+    header = f"  {'plane':<20s} {'z(mm)':>8s} " \
+             + " ".join([f"E_{wls_nm[li]:.1f}nm(%)".rjust(14) for li in range(L)]) \
+             + f" {'E_total(%)':>12s}"
+    print(header)
+    for i, k in enumerate(plane_keys):
+        row = f"  {k:<20s} {plane_z_m[i]*1e3:>8.2f} "
+        row += " ".join([f"{energy_planes_per_wl_norm[i, li]*100:>13.2f}" for li in range(L)])
+        row += f" {energy_planes_total_norm[i]*100:>11.2f}"
+        print(row)
+
+    # =========================================================
+    # MAT export (store all L) + new energy fields
+    # =========================================================
     slice_names = np.array([r["key"] for r in records], dtype=object)
     slice_desc = np.array([r["description"] for r in records], dtype=object)
     z_positions = np.array([r["z"] for r in records], dtype=np.float64)
@@ -1684,10 +1758,26 @@ def capture_eigenmode_propagation_multiwl(
             "z_layers": np.array([z_layers], dtype=np.float64),
             "z_prop": np.array([z_prop], dtype=np.float64),
             "base_wavelength_idx": np.array([base_idx], dtype=np.int32),
+
+            # ---- new: per-layer energy bookkeeping ----
+            "plane_keys":                np.array(plane_keys, dtype=object),
+            "plane_z_m":                 plane_z_m,
+            "energy_planes_per_wl":      energy_planes_per_wl,         # (Nplanes, L)
+            "energy_planes_total":       energy_planes_total,          # (Nplanes,)
+            "energy_planes_per_wl_norm": energy_planes_per_wl_norm,    # (Nplanes, L)
+            "energy_planes_total_norm":  energy_planes_total_norm,     # (Nplanes,)
         },
     )
 
-    return {"fig_path": str(fig_path), "mat_path": str(mat_path)}
+    return {
+        "fig_path":        str(fig_path),
+        "mat_path":        str(mat_path),
+        "energy_fig_path": str(energy_fig_path),
+        "plane_keys":      plane_keys,
+        "plane_z_m":       plane_z_m,
+        "energy_planes_per_wl_norm": energy_planes_per_wl_norm,
+        "energy_planes_total_norm":  energy_planes_total_norm,
+    }
 
 @torch.no_grad()
 def save_mode_triptych_multiwl(

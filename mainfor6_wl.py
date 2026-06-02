@@ -68,7 +68,7 @@ print("Using Device:", device)
 # Parameters
 # ============================================================
 field_size = 176
-layer_size = 300
+layer_size = 600
 num_modes = 10
 
 circle_focus_radius = 5
