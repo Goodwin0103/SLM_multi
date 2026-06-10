@@ -37,7 +37,7 @@ from odnn_training_visualization import visualize_phase_masks
 
 from odnn_training_visualization import (
     capture_eigenmode_propagation_multiwl,
-    visualize_model_slices_multiwl,         
+    visualize_model_slices_multiwl,
     capture_eigenmode_propagation,
     export_superposition_slices,
     plot_amplitude_comparison_grid,
@@ -46,13 +46,15 @@ from odnn_training_visualization import (
     save_superposition_triptych,
     save_mode_triptych,
     visualize_model_slices,
-    save_mode_triptych_multiwl,  
+    save_mode_triptych_multiwl,
 )
 from odnn_training_eval import (
     spot_energy_and_snr,
     _make_circle_mask,
-    evaluate_snr_isolation_crosstalk_multiwl,
-    evaluate_target_wl_over_all_wl_roi_ratio,
+)
+from odnn_multiwl_metrices import (
+    evaluate_multiwl_comprehensive_metrics,
+    plot_and_save_multiwl_metrics,
 )
 
 # ============================================================
@@ -95,21 +97,16 @@ num_superposition_train_samples = 100
 superposition_eval_seed = 20240116
 superposition_train_seed = 20240115
 
-# num_layer_option = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]
 num_layer_option = [1, 2, 3, 4]
 
 # SLM
-# z_layers = 49.465e-3
 z_layers = 45e-3
 pixel_size = 12.5e-6
 z_prop = 20e-2
 z_input_to_first = 0
 
 # wavelengths (MultiWL)
-# wavelengths = np.array([532e-9, 650e-9], dtype=np.float32)
 wavelengths = np.array([1535e-9, 1535.5e-9], dtype=np.float32)
-# wavelengths = np.array([1535e-9], dtype=np.float32)
-# wavelengths = np.array([900e-9, 900.5e-9], dtype=np.float32)
 base_wavelength_idx = 0
 L = int(len(wavelengths))
 
@@ -285,7 +282,7 @@ def save_training_curves(
     return {"loss_plot": loss_plot_path, "time_plot": time_plot_path, "mat": mat_path, "total_time": total_time}
 
 
-def _make_circle_mask(h: int, w: int, r: float, device: torch.device) -> torch.Tensor:
+def _make_circle_mask_local(h: int, w: int, r: float, device: torch.device) -> torch.Tensor:
     yy, xx = torch.meshgrid(
         torch.arange(h, device=device),
         torch.arange(w, device=device),
@@ -310,265 +307,12 @@ def region_energy_fractions(
     for mi, (x0, x1, y0, y1) in enumerate(evaluation_regions):
         patch = I_bhw[:, y0:y1, x0:x1]
         hh, ww = patch.shape[-2], patch.shape[-1]
-        cmask = _make_circle_mask(hh, ww, float(detect_radius), device=I_bhw.device)
+        cmask = _make_circle_mask_local(hh, ww, float(detect_radius), device=I_bhw.device)
         out[:, mi] = (patch * cmask.unsqueeze(0)).sum(dim=(-1, -2))
 
     out = out / (out.sum(dim=1, keepdim=True) + 1e-12)
     return out
 
-
-@torch.no_grad()
-def evaluate_target_wl_over_all_wl_roi_ratio(
-    model: D2NNModelMultiWL,
-    loader: DataLoader,
-    *,
-    device: torch.device,
-    evaluation_regions: list[tuple[int, int, int, int]],
-    detect_radius: int,
-    L: int,
-    num_modes: int,
-) -> dict:
-    model.eval()
-    ratio_list = []
-
-    for images, label_img, amp in loader:
-        images = images.to(device, dtype=torch.complex64, non_blocking=True)
-        if images.ndim == 3:
-            images = images.unsqueeze(1)
-
-        x = images.repeat(1, L, 1, 1).contiguous()
-        I_blhw = model(x).to(torch.float32)
-        B = I_blhw.shape[0]
-
-        ratios = torch.zeros((B, L), device=device, dtype=torch.float32)
-
-        for s in range(L):
-            src = I_blhw[:, s]
-            E_in_each_wl_roi = torch.zeros((B, L), device=device, dtype=torch.float32)
-
-            for t in range(L):
-                t_regions = [evaluation_regions[m * L + t] for m in range(num_modes)]
-                total = torch.zeros((B,), device=device, dtype=torch.float32)
-                for (x0, x1, y0, y1) in t_regions:
-                    patch = src[:, y0:y1, x0:x1]
-                    hh, ww = patch.shape[-2], patch.shape[-1]
-                    cmask = _make_circle_mask(hh, ww, float(detect_radius), device=device)
-                    total += (patch * cmask.unsqueeze(0)).sum(dim=(-1, -2))
-                E_in_each_wl_roi[:, t] = total
-
-            denom = E_in_each_wl_roi.sum(dim=1) + 1e-12
-            ratios[:, s] = E_in_each_wl_roi[:, s] / denom
-
-        ratio_list.append(ratios.detach().cpu())
-
-    ratio_all = torch.cat(ratio_list, dim=0).numpy()
-    return {
-        "ratio_mean": float(ratio_all.mean()),
-        "ratio_per_wl": ratio_all.mean(axis=0),
-    }
-
-
-@torch.no_grad()
-def evaluate_spot_metrics_multiwl(
-    model: D2NNModelMultiWL,
-    loader: DataLoader,
-    *,
-    device: torch.device,
-    evaluation_regions: list,
-    detect_radius: int,
-    wl_idx: int,
-    L: int,
-    num_modes: int,
-) -> dict:
-    model.eval()
-    pred_amp_list, true_amp_list = [], []
-
-    for images, label_img, amp in loader:
-        images = images.to(device, dtype=torch.complex64, non_blocking=True)
-        amp = amp.to(device, dtype=torch.float32, non_blocking=True)
-
-        if images.ndim == 3:
-            images = images.unsqueeze(1)
-
-        amp2 = amp ** 2
-        true_energy_frac = amp2 / (amp2.sum(dim=1, keepdim=True) + 1e-12)
-        true_amp_frac = torch.sqrt(true_energy_frac + 1e-12)
-        true_amp_list.append(true_amp_frac.detach().cpu())
-
-        x = images.repeat(1, L, 1, 1).contiguous()
-        I_blhw = model(x)
-        I_bhw = I_blhw[:, wl_idx].to(torch.float32)
-
-        wl_regions = [evaluation_regions[k * L + wl_idx] for k in range(num_modes)]
-
-        pred_energy_frac = region_energy_fractions(
-            I_bhw,
-            evaluation_regions=wl_regions,
-            detect_radius=detect_radius,
-        )
-        pred_amp_frac = torch.sqrt(pred_energy_frac + 1e-12)
-        pred_amp_list.append(pred_amp_frac.detach().cpu())
-
-    pred = torch.cat(pred_amp_list, dim=0).numpy()
-    true = torch.cat(true_amp_list, dim=0).numpy()
-
-    diff = pred - true
-    abs_diff = np.abs(diff)
-    rel = abs_diff / (np.abs(true) + 1e-12)
-    cc = np.asarray([_per_sample_corrcoef(pred[i], true[i]) for i in range(pred.shape[0])], dtype=np.float64)
-
-    return {
-        "avg_amplitudes_diff": float(abs_diff.mean()),
-        "avg_relative_amp_err": float(rel.mean()),
-        "cc_recon_amp": cc,
-        "amplitudes_diff": diff,
-    }
-
-# ============================================================
-# ============================================================
-# Multi-wavelength: SNR / Isolation / Crosstalk
-# ============================================================
-# ============================================================
-@torch.no_grad()
-def evaluate_wavelength_isolation(
-    model: D2NNModelMultiWL,
-    loader: DataLoader,
-    *,
-    device: torch.device,
-    evaluation_regions: list,
-    detect_radius: int,
-    L: int,
-    num_modes: int,
-    eps: float = 1e-12,
-) -> dict:
-    """
-    Wavelength isolation:
-        在第 t 个 λ 的 ROI 集合内,
-        E_target(t) = 该 λ 自己作为输入光时落入这组 ROI 的能量
-        E_other(t)  = 其他 λ 作为输入光时落入这组 ROI 的能量(平均/最大)
-        ISO_wl(t)  = 10*log10( E_target / mean(E_other_others) )
-        ISO_wl_wc  = 10*log10( E_target / max (E_other_others) )
-
-    返回:
-        wl_iso_mean_db : (L,) — 每个目标波长的 mean isolation
-        wl_iso_wc_db   : (L,) — 每个目标波长的 worst-case isolation
-        wl_crosstalk   : (L, L) — 行=源 λ, 列=目标 ROI λ; 每行能量比例(归一化)
-    """
-    model.eval()
-
-    # 累加每个 source λ -> 每个 ROI λ 的能量比例
-    R_sum   = np.zeros((L, L), dtype=np.float64)
-    R_count = np.zeros(L,       dtype=np.int64)
-
-    for images, label_img, amp in loader:
-        images = images.to(device, dtype=torch.complex64, non_blocking=True)
-        if images.ndim == 3:
-            images = images.unsqueeze(1)
-
-        x = images.repeat(1, L, 1, 1).contiguous()
-        I_blhw = model(x).to(torch.float32)              # (B, L, H, W)
-        B = I_blhw.shape[0]
-
-        # E_st[s, t]: 第 s 个源 λ 的输出图,落入第 t 个 λ 的全部模式 ROI 的能量
-        for s in range(L):
-            src = I_blhw[:, s]                           # (B, H, W)
-            E_t = torch.zeros((B, L), device=device, dtype=torch.float32)
-            for t in range(L):
-                t_regions = [evaluation_regions[m * L + t] for m in range(num_modes)]
-                tot = torch.zeros((B,), device=device, dtype=torch.float32)
-                for (x0, x1, y0, y1) in t_regions:
-                    patch = src[:, y0:y1, x0:x1]
-                    hh, ww = patch.shape[-2], patch.shape[-1]
-                    cmask  = _make_circle_mask(hh, ww, float(detect_radius), device=device)
-                    tot   += (patch * cmask.unsqueeze(0)).sum(dim=(-1, -2))
-                E_t[:, t] = tot
-
-            # 归一化为该源 λ 在不同 ROI-λ 集合上的能量分布
-            E_np = E_t.detach().cpu().numpy().astype(np.float64)
-            row  = E_np / (E_np.sum(axis=1, keepdims=True) + eps)   # (B, L)
-            R_sum[s]   += row.sum(axis=0)
-            R_count[s] += B
-
-    # 平均 crosstalk 矩阵 R[s, t]
-    R = np.full((L, L), np.nan, dtype=np.float64)
-    for s in range(L):
-        if R_count[s] > 0:
-            R[s] = R_sum[s] / R_count[s]
-
-    # —— 计算 isolation —— 
-    wl_iso_mean_db = np.full(L, np.nan, dtype=np.float64)
-    wl_iso_wc_db   = np.full(L, np.nan, dtype=np.float64)
-    for t in range(L):
-        # E_target = 自身 λ 输入到自身 ROI 的能量比
-        Et = R[t, t]
-        # E_others = 其他 λ 输入到该 ROI 的能量比
-        mask = np.ones(L, dtype=bool); mask[t] = False
-        E_others = R[mask, t]
-        if E_others.size == 0 or not np.isfinite(Et):
-            continue
-        wl_iso_mean_db[t] = 10.0 * np.log10((Et + eps) / (E_others.mean() + eps))
-        wl_iso_wc_db[t]   = 10.0 * np.log10((Et + eps) / (E_others.max()  + eps))
-
-    return {
-        "wl_iso_mean_db":  wl_iso_mean_db,        # (L,)
-        "wl_iso_wc_db":    wl_iso_wc_db,          # (L,)
-        "wl_crosstalk":    R,                     # (L, L)
-    }
-
-@torch.no_grad()
-def evaluate_insertion_loss_multiwl(
-    model: D2NNModelMultiWL,
-    *,
-    eigenmodes_list: torch.Tensor,   # (M, H, W) complex64 的原始 eigenmode (首层 SLM 之前)
-    layer_size: int,
-    device: torch.device,
-    L: int,
-    eps: float = 1e-12,
-) -> dict:
-    """
-    Overall Insertion Loss per wavelength:
-        IL(λ) = -10 * log10( <E_out(λ) / E_in>_modes )
-      E_in  = sum |MMF_data_ts[m]|^2          (首层 SLM 之前)
-      E_out = sum I_pred[m, λ]                (camera plane / 输出强度图)
-    """
-    model.eval()
-    M = int(eigenmodes_list.shape[0])
-
-    # E_in 与波长无关(同一个 eigenmode 复场)
-    E_in_per_mode = np.zeros(M, dtype=np.float64)
-    # E_out: (M, L)
-    E_out_per_mode_wl = np.zeros((M, L), dtype=np.float64)
-
-    for m_idx in range(M):
-        raw = eigenmodes_list[m_idx]                                    # (H, W) complex
-        E_in_per_mode[m_idx] = float((raw.abs() ** 2).sum().item())
-
-        # pad 到 layer_size,然后 forward
-        padded = pad_field_to_layer(raw.to(device, dtype=torch.complex64),
-                                    layer_size).unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
-        x = padded.repeat(1, L, 1, 1).contiguous()                          # (1,L,H,W)
-        I_blhw = model(x).to(torch.float32)                                  # (1,L,H,W)
-        E_out_per_mode_wl[m_idx] = (
-            I_blhw[0].sum(dim=(-1, -2)).detach().cpu().numpy().astype(np.float64)
-        )
-
-    # ratio per (mode, λ)
-    ratio_ml = E_out_per_mode_wl / np.clip(E_in_per_mode[:, None], eps, None)  # (M, L)
-
-    # 与 isolation 一致:线性域跨模式平均 → 转 dB
-    ratio_mean_per_wl = ratio_ml.mean(axis=0)                                  # (L,)
-    il_db_per_wl      = -10.0 * np.log10(np.clip(ratio_mean_per_wl, eps, None))
-
-    # std (跨模式 dB 域)
-    il_db_per_mode_wl = -10.0 * np.log10(np.clip(ratio_ml, eps, None))         # (M, L)
-    il_db_std_per_wl  = il_db_per_mode_wl.std(axis=0)                          # (L,)
-
-    return {
-        "il_db_per_wl":         il_db_per_wl,           # (L,)
-        "il_db_std_per_wl":     il_db_std_per_wl,       # (L,)
-        "energy_ratio_per_wl":  ratio_mean_per_wl,      # (L,)  线性 <E_out/E_in>
-        "energy_ratio_per_mode_wl": ratio_ml,           # (M, L)
-    }
 
 @torch.no_grad()
 def save_prediction_diagnostics_multiwl(
@@ -629,35 +373,20 @@ def save_prediction_diagnostics_multiwl(
 
             ax_label = fig.add_subplot(gs[0, 1 + 2 * li])
             ax_label.imshow(labels_per_wl[li], cmap="inferno")
-            ax_label.set_title(
-                f"Label λ={wavelengths[li] * 1e9:.0f}nm",
-                fontsize=10, fontweight="bold",
-            )
+            ax_label.set_title(f"Label λ={wavelengths[li] * 1e9:.0f}nm", fontsize=10, fontweight="bold")
             ax_label.axis("off")
 
             axI = fig.add_subplot(gs[0, 2 + 2 * li])
             I_li = I_pred[0, li].detach().cpu().numpy()
             axI.imshow(I_li, cmap="inferno")
-            axI.set_title(
-                f"Pred λ={wavelengths[li] * 1e9:.0f}nm",
-                fontsize=10, fontweight="bold",
-            )
+            axI.set_title(f"Pred λ={wavelengths[li] * 1e9:.0f}nm", fontsize=10, fontweight="bold")
             axI.axis("off")
 
             for (x0, x1, y0, y1) in wl_regions:
                 cx = (x0 + x1) / 2.0
                 cy = (y0 + y1) / 2.0
-                axI.add_patch(
-                    Circle(
-                        (cx, cy),
-                        radius=detect_radius,
-                        linewidth=0.8,
-                        edgecolor="cyan",
-                        facecolor="none",
-                        linestyle=":",
-                        alpha=0.9,
-                    )
-                )
+                axI.add_patch(Circle((cx, cy), radius=detect_radius, linewidth=0.8,
+                                     edgecolor="cyan", facecolor="none", linestyle=":", alpha=0.9))
 
             I_bhw = I_pred[:, li].to(torch.float32)
             pred_energy_frac = region_energy_fractions(
@@ -682,7 +411,6 @@ def save_prediction_diagnostics_multiwl(
 
         ax_wl = fig.add_subplot(gs[2, :])
         R = np.zeros((Lloc, Lloc), dtype=np.float64)
-
         for s in range(Lloc):
             src_img = I_pred[0, s].detach().cpu().numpy()
             E_st = np.zeros(Lloc, dtype=np.float64)
@@ -705,11 +433,8 @@ def save_prediction_diagnostics_multiwl(
         bar_w = group_width / Lloc
         for t in range(Lloc):
             offset = (t - (Lloc - 1) / 2.0) * bar_w
-            ax_wl.bar(
-                x_axis + offset, R[:, t],
-                width=bar_w * 0.95, alpha=0.85,
-                label=f"ROI@{wavelengths[t] * 1e9:.0f}nm",
-            )
+            ax_wl.bar(x_axis + offset, R[:, t], width=bar_w * 0.95, alpha=0.85,
+                      label=f"ROI@{wavelengths[t] * 1e9:.0f}nm")
 
         ax_wl.set_ylim(0.0, 1.0)
         ax_wl.set_ylabel("Pred Energy Ratio\n(over ROI wavelength sets)")
@@ -717,16 +442,10 @@ def save_prediction_diagnostics_multiwl(
         ax_wl.set_xticklabels([f"{w * 1e9:.0f}" for w in wavelengths])
         ax_wl.set_xlabel("Source wavelength (nm)")
         ax_wl.grid(True, axis="y", alpha=0.25)
-        ax_wl.set_title(
-            "Predicted energy distribution of each source λ across wavelength-ROI sets",
-            fontsize=11,
-        )
+        ax_wl.set_title("Predicted energy distribution of each source λ across wavelength-ROI sets", fontsize=11)
         ax_wl.legend(ncol=min(Lloc, 6), fontsize=9, loc="upper right")
 
-        fig.suptitle(
-            f"MultiWL Prediction Analysis - Sample {si}",
-            fontsize=14, fontweight="bold", y=0.98,
-        )
+        fig.suptitle(f"MultiWL Prediction Analysis - Sample {si}", fontsize=14, fontweight="bold", y=0.98)
         fig.tight_layout(rect=[0, 0.02, 1, 0.96])
 
         out_path = out_dir / f"{tag}_sample{si:04d}.png"
@@ -798,7 +517,6 @@ mmf_label_patterns, evaluation_regions = generate_detector_patterns_multiwl(
 )
 
 MMF_Label_data = torch.from_numpy(mmf_label_patterns).to(torch.float32)
-
 print(f"✔ Generated {len(evaluation_regions)} evaluation regions")
 
 # Overlap debug
@@ -939,22 +657,8 @@ def build_superposition_dataset_multiwl(num_samples: int, rng_seed: int) -> tupl
 # Train/Eval loop
 # ============================================================
 all_losses: list[list[float]] = []
-metrics_by_wl: dict[int, list[dict]] = {int(li): [] for li in range(L)}
 
-# === 顶层 per-layer 容器（必须在 num_layer 循环之外）===
-snr_db_per_layer:           dict[int, np.ndarray] = {}   # (L,)
-iso_mean_per_layer:         dict[int, np.ndarray] = {}   # (L,)
-iso_wc_per_layer:           dict[int, np.ndarray] = {}   # (L,)
-crosstalk_per_layer:        dict[int, np.ndarray] = {}   # (L, M, M)
-iso_mean_allroi_per_layer:  dict[int, np.ndarray] = {}   # (L,)
-iso_wc_allroi_per_layer:    dict[int, np.ndarray] = {}   # (L,)
-crosstalk_full_per_layer:   dict[int, np.ndarray] = {}   # (L, M, M*L)
-target_ratio_per_layer:     dict[int, np.ndarray] = {}   # (L,)
-wl_iso_mean_per_layer:     dict[int, np.ndarray] = {}   # (L,)  — 每个目标 λ 的 mean iso
-wl_iso_wc_per_layer:       dict[int, np.ndarray] = {}   # (L,)  — worst case
-wl_crosstalk_per_layer:    dict[int, np.ndarray] = {}   # (L, L) — λ-λ 串扰矩阵
-il_db_per_layer:           dict[int, np.ndarray] = {}   # (L,)  — overall IL per λ
-il_db_std_per_layer:       dict[int, np.ndarray] = {}   # (L,)  — std across modes
+comprehensive_metrics_per_layer: dict[int, dict] = {}
 
 detect_radius_eval = int(detectsize // 2)
 
@@ -972,7 +676,6 @@ for num_layer in num_layer_option:
     else:
         raise ValueError("Unknown training_dataset_mode")
 
-    mode_triptych_records: list[dict[str]] = []
     if evaluation_mode == "eigenmode":
         test_datasets_per_wl, test_meta = build_eigenmode_dataset_multiwl()
     elif evaluation_mode == "superposition":
@@ -1097,21 +800,19 @@ for num_layer in num_layer_option:
     if diag_paths:
         print(f"✔ Prediction diagnostics ({len(diag_paths)}) -> {diag_paths[0].parent}")
 
-# ============================================================
-# Per-layer propagation slices (multi-wavelength)
-# ============================================================
+    # ============================================================
+    # Per-layer propagation slices (multi-wavelength)
+    # ============================================================
     slice_dir = RUN_ROOT / "propagation_slices" / f"L{num_layer}_{run_tag}"
     slice_dir.mkdir(parents=True, exist_ok=True)
 
-    # 用 eigenmode 作为输入（每个模式一份），便于看每层之间的能量演化
-    eigen_ds = test_datasets_per_wl[0]   # 任意 wl 的数据集都行（输入复场是共享的）
+    eigen_ds = test_datasets_per_wl[0]
     n_modes_to_dump = min(num_modes, len(eigen_ds))
 
     for mode_idx in range(n_modes_to_dump):
-        # 取出已经 pad 到 layer_size 的复场（dataset 里 image_tensor[i] shape: (1,H,W) 或 (H,W)）
         img_complex, _label_img, _amp = eigen_ds[mode_idx]
         if img_complex.ndim == 3:
-            eigen_field = img_complex.squeeze(0)   # (H,W) complex
+            eigen_field = img_complex.squeeze(0)
         else:
             eigen_field = img_complex
 
@@ -1128,7 +829,6 @@ for num_layer in num_layer_option:
             output_dir=slice_dir,
             tag=f"L{num_layer}_mode{mode_idx+1}",
             base_wavelength_idx=base_wavelength_idx,
-            # 每层段内采样位置（0~1 的比例），可按需加密
             fractions_between_layers=tuple(
                 (1/4, 1/2, 3/4) for _ in range(num_layer)
             ),
@@ -1136,135 +836,29 @@ for num_layer in num_layer_option:
         )
         print(f"  ✔ mode {mode_idx+1} slices -> {info['fig_path']}")
         print(f"  ✔ mode {mode_idx+1} .mat   -> {info['mat_path']}")
-    # ===== 评估指标（移出 if diag_paths 块，无条件执行）=====
-    snr_db_arr   = np.full(L, np.nan, dtype=np.float64)
-    iso_mean_arr = np.full(L, np.nan, dtype=np.float64)
-    iso_wc_arr   = np.full(L, np.nan, dtype=np.float64)
-    cm_stack     = np.full((L, num_modes, num_modes), np.nan, dtype=np.float64)
 
-    iso_mean_allroi_arr = np.full(L, np.nan, dtype=np.float64)
-    iso_wc_allroi_arr   = np.full(L, np.nan, dtype=np.float64)
-    ct_full_stack       = np.full((L, num_modes, num_modes * L), np.nan, dtype=np.float64)
-
-    for li in range(L):
-        test_loader_wl = DataLoader(test_datasets_per_wl[li], batch_size=batch_size, shuffle=False)
-
-        # —— amp_err / rel / cc ——
-        metrics = evaluate_spot_metrics_multiwl(
-            model,
-            test_loader_wl,
-            device=device,
-            evaluation_regions=evaluation_regions,
-            detect_radius=detect_radius_eval,
-            wl_idx=li,
-            L=L,
-            num_modes=num_modes,
-        )
-        cc_mean = float(np.nanmean(metrics["cc_recon_amp"]))
-        cc_std  = float(np.nanstd(metrics["cc_recon_amp"]))
-
-        # —— SNR / isolation / crosstalk ——
-        m_extra = evaluate_snr_isolation_crosstalk_multiwl(
-            model,
-            test_loader_wl,
-            device=device,
-            evaluation_regions=evaluation_regions,
-            detect_radius=detect_radius_eval,
-            wl_idx=li,
-            L=L,
-            num_modes=num_modes,
-        )
-        snr_db_arr[li]          = m_extra["snr_db_full"]
-        iso_mean_arr[li]        = m_extra["isolation_db_mean"]
-        iso_wc_arr[li]          = m_extra["isolation_db_wc"]
-        cm_stack[li]            = m_extra["crosstalk_matrix"]
-        iso_mean_allroi_arr[li] = m_extra["isolation_db_mean_allroi"]
-        iso_wc_allroi_arr[li]   = m_extra["isolation_db_wc_allroi"]
-        ct_full_stack[li]       = m_extra["crosstalk_matrix_full"]
-
-        print(
-            f"[Metrics | {num_layer} layers | λ_idx={li} | λ={wavelengths[li] * 1e9:.1f} nm] "
-            f"amp_err={metrics['avg_amplitudes_diff']:.4f}, "
-            f"rel={metrics['avg_relative_amp_err']:.4f}, "
-            f"cc={cc_mean:.4f}±{cc_std:.4f}, "
-            f"SNR_cont={snr_db_arr[li]:.2f}dB, "
-            f"iso(mean/wc)={iso_mean_arr[li]:.2f}/{iso_wc_arr[li]:.2f}dB, "
-            f"iso_all(mean/wc)={iso_mean_allroi_arr[li]:.2f}/{iso_wc_allroi_arr[li]:.2f}dB"
-        )
-
-        metrics_by_wl[int(li)].append({
-            "num_layers": int(num_layer),
-            **metrics,
-            "snr_db_full":              float(snr_db_arr[li]),
-            "isolation_db_mean":        float(iso_mean_arr[li]),
-            "isolation_db_wc":          float(iso_wc_arr[li]),
-            "isolation_db_mean_allroi": float(iso_mean_allroi_arr[li]),
-            "isolation_db_wc_allroi":   float(iso_wc_allroi_arr[li]),
-        })
-
-    # 在波长循环结束后写入 per-layer 容器
-    snr_db_per_layer[int(num_layer)]          = snr_db_arr
-    iso_mean_per_layer[int(num_layer)]        = iso_mean_arr
-    iso_wc_per_layer[int(num_layer)]          = iso_wc_arr
-    crosstalk_per_layer[int(num_layer)]       = cm_stack
-    iso_mean_allroi_per_layer[int(num_layer)] = iso_mean_allroi_arr
-    iso_wc_allroi_per_layer[int(num_layer)]   = iso_wc_allroi_arr
-    crosstalk_full_per_layer[int(num_layer)]  = ct_full_stack
-
-    # ===== 目标波长 / 全波长 ROI 比例 =====
-    test_loader_any = DataLoader(test_datasets_per_wl[0], batch_size=batch_size, shuffle=False)
-    wl_ratio = evaluate_target_wl_over_all_wl_roi_ratio(
+    # ============================================================
+    # Metrics: SNR / Isolation / Crosstalk / Insertion Loss
+    # ============================================================
+    comp_metrics = evaluate_multiwl_comprehensive_metrics(
         model,
-        test_loader_any,
-        device=device,
-        evaluation_regions=evaluation_regions,
+        evaluation_regions,
         detect_radius=detect_radius_eval,
-        L=L,
-        num_modes=num_modes,
-    )
-    target_ratio_per_layer[int(num_layer)] = wl_ratio["ratio_per_wl"]
-
-    # ===== Wavelength isolation (λ–λ) =====
-    test_loader_wlIso = DataLoader(test_datasets_per_wl[0], batch_size=batch_size, shuffle=False)
-    wl_iso = evaluate_wavelength_isolation(
-        model,
-        test_loader_wlIso,
         device=device,
-        evaluation_regions=evaluation_regions,
-        detect_radius=detect_radius_eval,
-        L=L,
         num_modes=num_modes,
-    )
-    wl_iso_mean_per_layer[int(num_layer)]   = wl_iso["wl_iso_mean_db"]
-    wl_iso_wc_per_layer[int(num_layer)]     = wl_iso["wl_iso_wc_db"]
-    wl_crosstalk_per_layer[int(num_layer)]  = wl_iso["wl_crosstalk"]
-
-    print(
-        f"[Wavelength Isolation | {num_layer} layers] "
-        f"mean(per λ)={np.array2string(wl_iso['wl_iso_mean_db'], precision=2)} dB,  "
-        f"wc(per λ)={np.array2string(wl_iso['wl_iso_wc_db'], precision=2)} dB"
-    )
-
-    # ===== Overall Insertion Loss (per λ, 输入面 = 首层 SLM 之前) =====
-    il_res = evaluate_insertion_loss_multiwl(
-        model,
-        eigenmodes_list=MMF_data_ts,
+        num_wavelengths=L,
+        wavelengths_m=wavelengths,
+        mmf_modes=MMF_data_ts,
         layer_size=layer_size,
-        device=device,
-        L=L,
     )
-    il_db_per_layer[int(num_layer)]     = il_res["il_db_per_wl"]
-    il_db_std_per_layer[int(num_layer)] = il_res["il_db_std_per_wl"]
+    comprehensive_metrics_per_layer[int(num_layer)] = comp_metrics
 
     print(
-        f"[Insertion Loss | {num_layer} layers] "
-        f"IL(per λ)={np.array2string(il_res['il_db_per_wl'], precision=2)} dB  "
-        f"±{np.array2string(il_res['il_db_std_per_wl'], precision=2)}"
-    )
-
-    print(
-        f"[TargetWL/AllWL ROI | {num_layer} layers] "
-        f"mean={wl_ratio['ratio_mean']:.6f}, per_wl={wl_ratio['ratio_per_wl']}"
+        f"\n[{num_layer} layers] "
+        f"SNR={comp_metrics['snr_db_mean']:.2f} dB, "
+        f"Mode Iso={comp_metrics['mode_isolation_db_mean']:.2f} dB, "
+        f"WL Iso={comp_metrics['wavelength_isolation_db_mean']:.2f} dB, "
+        f"IL={comp_metrics['insertion_loss_db_mean']:.2f} dB"
     )
 
     if torch.cuda.is_available():
@@ -1274,7 +868,6 @@ print("\n" + "=" * 70)
 print("All training completed!")
 print("=" * 70)
 
-
 # ============================================================
 # 保存指标分析
 # ============================================================
@@ -1282,273 +875,226 @@ metrics_dir = RUN_ROOT / "metrics_analysis"
 metrics_dir.mkdir(parents=True, exist_ok=True)
 tag = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-sorted_layers = sorted(snr_db_per_layer.keys())
-layer_counts  = np.asarray(sorted_layers, dtype=np.int32)
-NL = len(layer_counts)
+sorted_layers = sorted(comprehensive_metrics_per_layer.keys())
 
+if len(sorted_layers) == 0:
+    print("⚠ No metrics were computed! Check that training loop completed.")
+else:
+    layer_counts = np.asarray(sorted_layers, dtype=np.int32)
 
-def _collect_per_wl(field_extractor) -> np.ndarray:
-    M = np.full((NL, L), np.nan, dtype=np.float64)
-    for li in range(L):
-        mlist = metrics_by_wl.get(int(li), [])
-        mlist_sorted = sorted(mlist, key=lambda d: d["num_layers"])
-        for i, m in enumerate(mlist_sorted):
-            if i < NL:
-                M[i, li] = field_extractor(m)
-    return M
+    # ---- 汇总核心指标 ----
+    snr_mean_arr = np.array([comprehensive_metrics_per_layer[nl]["snr_db_mean"] for nl in sorted_layers])
+    mode_iso_arr = np.array([comprehensive_metrics_per_layer[nl]["mode_isolation_db_mean"] for nl in sorted_layers])
+    wl_iso_arr = np.array([comprehensive_metrics_per_layer[nl]["wavelength_isolation_db_mean"] for nl in sorted_layers])
+    target_all_roi_db_arr = np.array([
+        float(np.mean(comprehensive_metrics_per_layer[nl]["target_all_roi_db"]))
+        for nl in sorted_layers
+    ])
+    il_arr = np.array([comprehensive_metrics_per_layer[nl]["insertion_loss_db_mean"] for nl in sorted_layers])
 
+    # ---- 5-panel 汇总图 ----
+    fig, axes = plt.subplots(2, 3, figsize=(16, 9))
 
-M_amp_err   = _collect_per_wl(lambda m: float(m["avg_amplitudes_diff"]))
-M_rel_err   = _collect_per_wl(lambda m: float(m["avg_relative_amp_err"]))
-M_cc_mean   = _collect_per_wl(lambda m: float(np.nanmean(m["cc_recon_amp"])))
-M_cc_std    = _collect_per_wl(lambda m: float(np.nanstd(m["cc_recon_amp"])))
-M_snr_db    = np.vstack([snr_db_per_layer[nl]   for nl in sorted_layers])
-M_iso_mean  = np.vstack([iso_mean_per_layer[nl] for nl in sorted_layers])
-M_iso_wc    = np.vstack([iso_wc_per_layer[nl]   for nl in sorted_layers])
-M_iso_mean_all = np.vstack([iso_mean_allroi_per_layer[nl] for nl in sorted_layers])
-M_iso_wc_all   = np.vstack([iso_wc_allroi_per_layer[nl]   for nl in sorted_layers])
-M_target_wl = np.vstack([target_ratio_per_layer[nl] for nl in sorted_layers])
-CT_4d       = np.stack([crosstalk_per_layer[nl]      for nl in sorted_layers], axis=0)
-CT_full_4d  = np.stack([crosstalk_full_per_layer[nl] for nl in sorted_layers], axis=0)
+    # (0,0) SNR
+    axes[0, 0].plot(layer_counts, snr_mean_arr, marker="o", color="tab:blue", linewidth=2)
+    axes[0, 0].set_title("SNR (dB)")
+    axes[0, 0].set_xlabel("Layers"); axes[0, 0].set_ylabel("dB")
+    axes[0, 0].grid(True, alpha=0.3); axes[0, 0].set_xticks(layer_counts)
+    for x, y in zip(layer_counts, snr_mean_arr):
+        if np.isfinite(y):
+            axes[0, 0].annotate(f"{y:.2f}", (x, y), textcoords="offset points",
+                                xytext=(0, 8), ha="center", fontsize=9)
 
-wl_nm     = (wavelengths * 1e9).astype(np.float64)
-wl_labels = [f"{w:.0f} nm" for w in wl_nm]
-cmap_wl   = plt.cm.viridis(np.linspace(0.15, 0.85, L))
+    # (0,1) 三维 Isolation 合并对比
+    axes[0, 1].plot(layer_counts, mode_iso_arr, marker="o", color="tab:green",
+                    linewidth=2, label="① Same-λ Mode Iso")
+    axes[0, 1].plot(layer_counts, wl_iso_arr, marker="s", linestyle="--", color="tab:orange",
+                    linewidth=2, label="② Same-Mode WL Iso")
+    axes[0, 1].plot(layer_counts, target_all_roi_db_arr, marker="^", linestyle=":",
+                    color="tab:purple", linewidth=2, label="③ Target/All ROI")
+    axes[0, 1].set_title("Three Isolation Dimensions (dB)")
+    axes[0, 1].set_xlabel("Layers"); axes[0, 1].set_ylabel("dB")
+    axes[0, 1].legend(fontsize=9); axes[0, 1].grid(True, alpha=0.3)
+    axes[0, 1].set_xticks(layer_counts)
 
+    # (0,2) Insertion Loss
+    axes[0, 2].plot(layer_counts, il_arr, marker="o", color="tab:red", linewidth=2)
+    axes[0, 2].set_title("Insertion Loss (dB)")
+    axes[0, 2].set_xlabel("Layers"); axes[0, 2].set_ylabel("dB")
+    axes[0, 2].grid(True, alpha=0.3); axes[0, 2].set_xticks(layer_counts)
+    for x, y in zip(layer_counts, il_arr):
+        if np.isfinite(y):
+            axes[0, 2].annotate(f"{y:.2f}", (x, y), textcoords="offset points",
+                                xytext=(0, 8), ha="center", fontsize=9)
 
-def _save_single_metric(fname_stem: str, ylabel: str, title: str, plot_fn) -> Path:
+    # (1,0) Crosstalk heatmap (mode, last layer)
+    best_nl = sorted_layers[-1]
+    ct_mat = comprehensive_metrics_per_layer[best_nl]["crosstalk_matrix_per_wl"]  # (L, M, M)
+    ct_mean = ct_mat.mean(axis=0)
+    ct_db = 10.0 * np.log10(np.clip(ct_mean, 1e-6, None))
+    im = axes[1, 0].imshow(ct_db, cmap="magma", vmin=-30, vmax=0)
+    axes[1, 0].set_title(f"Mode Crosstalk (dB) — {best_nl} layers")
+    axes[1, 0].set_xlabel("ROI mode"); axes[1, 0].set_ylabel("Input mode")
+    axes[1, 0].set_xticks(range(num_modes)); axes[1, 0].set_yticks(range(num_modes))
+    fig.colorbar(im, ax=axes[1, 0], fraction=0.046, pad=0.04)
+    for r in range(num_modes):
+        for c in range(num_modes):
+            axes[1, 0].text(c, r, f"{ct_db[r, c]:.0f}", ha="center", va="center",
+                            color="white" if ct_db[r, c] < -15 else "black", fontsize=9)
+
+    # (1,1) Wavelength crosstalk heatmap (last layer, mode 0)
+    ct_wl = comprehensive_metrics_per_layer[best_nl]["crosstalk_matrix_wl"]  # (M, L, L)
+    ct_wl_mean = ct_wl.mean(axis=0)  # 跨 mode 平均 (L, L)
+    ct_wl_db = 10.0 * np.log10(np.clip(ct_wl_mean, 1e-6, None))
+    wl_nm = (wavelengths * 1e9).astype(np.float64)
+    im2 = axes[1, 1].imshow(ct_wl_db, cmap="magma", vmin=-30, vmax=0)
+    axes[1, 1].set_title(f"WL Crosstalk (dB) — {best_nl} layers")
+    axes[1, 1].set_xlabel("Target λ"); axes[1, 1].set_ylabel("Source λ")
+    axes[1, 1].set_xticks(range(L))
+    axes[1, 1].set_xticklabels([f"{w:.0f}" for w in wl_nm], fontsize=8)
+    axes[1, 1].set_yticks(range(L))
+    axes[1, 1].set_yticklabels([f"{w:.0f}" for w in wl_nm], fontsize=8)
+    fig.colorbar(im2, ax=axes[1, 1], fraction=0.046, pad=0.04)
+    for r in range(L):
+        for c in range(L):
+            axes[1, 1].text(c, r, f"{ct_wl_db[r, c]:.0f}", ha="center", va="center",
+                            color="white" if ct_wl_db[r, c] < -15 else "black", fontsize=9)
+
+    # (1,2) Target/All ROI per mode (bar chart, last layer)
+    tar_ratio = comprehensive_metrics_per_layer[best_nl]["target_all_roi_ratio"]  # (M,)
+    axes[1, 2].bar(range(num_modes), tar_ratio, color="tab:purple", alpha=0.8)
+    axes[1, 2].set_xticks(range(num_modes))
+    axes[1, 2].set_xticklabels([f"M{m+1}" for m in range(num_modes)])
+    axes[1, 2].set_ylabel("Target / All ROI")
+    axes[1, 2].set_title(f"Target/All ROI — {best_nl} layers")
+    axes[1, 2].set_ylim(0, 1.05)
+    axes[1, 2].axhline(float(np.mean(tar_ratio)), color="red", linestyle="--",
+                        label=f"mean={float(np.mean(tar_ratio)):.4f}")
+    axes[1, 2].legend(fontsize=9)
+    axes[1, 2].grid(axis="y", alpha=0.3)
+
+    fig.suptitle("Core Metrics vs. Number of Layers", fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    summary_path = metrics_dir / f"core_metrics_summary_{tag}.png"
+    fig.savefig(summary_path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"✔ Core metrics summary -> {summary_path}")
+
+    # ============================================================
+    # 单独折线图（每个指标一张大图）
+    # ============================================================
+
+    # 1. SNR
     fig, ax = plt.subplots(figsize=(7.5, 4.5))
-    plot_fn(ax)
-    ax.set_xlabel("Number of layers")
-    ax.set_ylabel(ylabel)
-    ax.set_xticks(layer_counts)
-    ax.set_title(title)
-    ax.grid(True, alpha=0.3)
-    ax.legend(loc="best", fontsize=9)
+    ax.plot(layer_counts, snr_mean_arr, marker="o", color="tab:red", linewidth=2, markersize=8)
+    ax.set_xlabel("Number of Layers", fontsize=12)
+    ax.set_ylabel("SNR (dB)", fontsize=12)
+    ax.set_title("Signal-to-Noise Ratio vs. Layer Count", fontsize=13)
+    ax.set_xticks(layer_counts); ax.grid(True, alpha=0.3, linestyle="--")
+    for x, y in zip(layer_counts, snr_mean_arr):
+        if np.isfinite(y):
+            ax.annotate(f"{y:.2f} dB", (x, y), textcoords="offset points",
+                        xytext=(0, 10), ha="center", fontsize=10, color="tab:red")
     fig.tight_layout()
-    out = metrics_dir / f"{fname_stem}_{tag}.png"
-    fig.savefig(out, dpi=300, bbox_inches="tight")
+    fig.savefig(metrics_dir / f"metric_snr_db_{tag}.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
-    print(f"  ✔ {ylabel:<28s} -> {out}")
-    return out
+    print(f"  ✔ SNR line chart saved")
 
+    # 2. Same-λ Mode Isolation (同波长内的 isolation)
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(layer_counts, mode_iso_arr, marker="o", color="tab:green", linewidth=2, markersize=8)
+    ax.set_xlabel("Number of Layers", fontsize=12)
+    ax.set_ylabel("Mode Isolation (dB)", fontsize=12)
+    ax.set_title("Same-Wavelength Mode Isolation vs. Layer Count\n"
+                 r"$10\log_{10}\left(\frac{E[m,l,m]}{\sum_{j\neq m} E[m,l,j]}\right)$",
+                 fontsize=12)
+    ax.set_xticks(layer_counts); ax.grid(True, alpha=0.3, linestyle="--")
+    for x, y in zip(layer_counts, mode_iso_arr):
+        if np.isfinite(y):
+            ax.annotate(f"{y:.2f} dB", (x, y), textcoords="offset points",
+                        xytext=(0, 10), ha="center", fontsize=10, color="tab:green")
+    fig.tight_layout()
+    fig.savefig(metrics_dir / f"metric_mode_isolation_db_{tag}.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✔ Same-λ Mode Isolation line chart saved")
 
-_save_single_metric(
-    "metric_avg_amp_error", "avg_amp_error",
-    "Average amplitude error vs. layers",
-    lambda ax: [ax.plot(layer_counts, M_amp_err[:, li], marker="o",
-                        color=cmap_wl[li], label=wl_labels[li]) for li in range(L)],
-)
+    # 3. Same-Mode Wavelength Isolation (同 mode 内的 isolation)
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(layer_counts, wl_iso_arr, marker="s", color="tab:orange", linewidth=2, markersize=8)
+    ax.set_xlabel("Number of Layers", fontsize=12)
+    ax.set_ylabel("Wavelength Isolation (dB)", fontsize=12)
+    ax.set_title("Same-Mode Wavelength Isolation vs. Layer Count\n"
+                 r"$10\log_{10}\left(\frac{E[m,l,m]}{\sum_{l'\neq l} E[m,l',m]}\right)$",
+                 fontsize=12)
+    ax.set_xticks(layer_counts); ax.grid(True, alpha=0.3, linestyle="--")
+    for x, y in zip(layer_counts, wl_iso_arr):
+        if np.isfinite(y):
+            ax.annotate(f"{y:.2f} dB", (x, y), textcoords="offset points",
+                        xytext=(0, 10), ha="center", fontsize=10, color="tab:orange")
+    fig.tight_layout()
+    fig.savefig(metrics_dir / f"metric_wl_isolation_db_{tag}.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✔ Same-Mode WL Isolation line chart saved")
 
-_save_single_metric(
-    "metric_avg_relative_amp_error", "avg_relative_amp_error",
-    "Average relative amplitude error vs. layers",
-    lambda ax: [ax.plot(layer_counts, M_rel_err[:, li], marker="o",
-                        color=cmap_wl[li], label=wl_labels[li]) for li in range(L)],
-)
+    # 4. Target / All ROI Isolation
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(layer_counts, target_all_roi_db_arr, marker="^", color="tab:purple",
+            linewidth=2, markersize=8)
+    ax.set_xlabel("Number of Layers", fontsize=12)
+    ax.set_ylabel("Target/All ROI (dB)", fontsize=12)
+    ax.set_title("Target vs. All ROI Isolation vs. Layer Count\n"
+                 r"$10\log_{10}\left(\frac{E_{target}}{E_{all} - E_{target}}\right)$",
+                 fontsize=12)
+    ax.set_xticks(layer_counts); ax.grid(True, alpha=0.3, linestyle="--")
+    for x, y in zip(layer_counts, target_all_roi_db_arr):
+        if np.isfinite(y):
+            ax.annotate(f"{y:.2f} dB", (x, y), textcoords="offset points",
+                        xytext=(0, 10), ha="center", fontsize=10, color="tab:purple")
+    fig.tight_layout()
+    fig.savefig(metrics_dir / f"metric_target_all_roi_db_{tag}.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✔ Target/All ROI Isolation line chart saved")
 
-_save_single_metric(
-    "metric_cc_amp", "cc_amp mean ± std",
-    "Reconstruction amplitude correlation vs. layers",
-    lambda ax: [ax.errorbar(layer_counts, M_cc_mean[:, li], yerr=M_cc_std[:, li],
-                            marker="o", capsize=3, color=cmap_wl[li],
-                            label=wl_labels[li]) for li in range(L)],
-)
+    # 5. Insertion Loss
+    fig, ax = plt.subplots(figsize=(7.5, 4.5))
+    ax.plot(layer_counts, il_arr, marker="o", color="tab:cyan", linewidth=2, markersize=8)
+    ax.set_xlabel("Number of Layers", fontsize=12)
+    ax.set_ylabel("Insertion Loss (dB)", fontsize=12)
+    ax.set_title("Insertion Loss vs. Layer Count\n"
+                 r"$\mathrm{IL} = -10\log_{10}(E_{out}/E_{in})$", fontsize=12)
+    ax.set_xticks(layer_counts); ax.grid(True, alpha=0.3, linestyle="--")
+    for x, y in zip(layer_counts, il_arr):
+        if np.isfinite(y):
+            ax.annotate(f"{y:.2f} dB", (x, y), textcoords="offset points",
+                        xytext=(0, 10), ha="center", fontsize=10, color="tab:cyan")
+    fig.tight_layout()
+    fig.savefig(metrics_dir / f"metric_insertion_loss_db_{tag}.png", dpi=300, bbox_inches="tight")
+    plt.close(fig)
+    print(f"  ✔ Insertion Loss line chart saved")
 
-_save_single_metric(
-    "metric_snr_full_db", "SNR_full (dB)",
-    "Signal containment (dB) vs. layers",
-    lambda ax: [ax.plot(layer_counts, M_snr_db[:, li], marker="o",
-                        color=cmap_wl[li], label=wl_labels[li]) for li in range(L)],
-)
+    # ---- 每个 num_layer 单独保存详细可视化和 .mat ----
+    for nl in sorted_layers:
+        m = comprehensive_metrics_per_layer[nl]
+        plot_and_save_multiwl_metrics(
+            m,
+            output_dir=metrics_dir / f"L{nl}",
+            tag=f"L{nl}_{tag}",
+            num_modes=num_modes,
+            num_wavelengths=L,
+        )
 
-_save_single_metric(
-    "metric_isolation_db_mean", "Isolation mean (dB)",
-    "Mode isolation (mean, same-λ) vs. layers",
-    lambda ax: [ax.plot(layer_counts, M_iso_mean[:, li], marker="o",
-                        color=cmap_wl[li], label=wl_labels[li]) for li in range(L)],
-)
+    # ---- 汇总 .mat ----
+    savemat(str(metrics_dir / f"metrics_summary_{tag}.mat"), {
+        "layers": layer_counts.astype(np.float64),
+        "wavelengths_m": wavelengths.astype(np.float64),
+        "snr_db_mean": snr_mean_arr,
+        # 三维 isolation
+        "mode_isolation_db_mean": mode_iso_arr,
+        "wavelength_isolation_db_mean": wl_iso_arr,
+        "target_all_roi_db_mean": target_all_roi_db_arr,
+        # insertion loss
+        "insertion_loss_db_mean": il_arr,
+    })
+    print(f"✔ Metrics .mat saved")
 
-_save_single_metric(
-    "metric_isolation_db_worst", "Isolation worst-case (dB)",
-    "Mode isolation (worst-case, same-λ) vs. layers",
-    lambda ax: [ax.plot(layer_counts, M_iso_wc[:, li], marker="s", linestyle="--",
-                        color=cmap_wl[li], label=wl_labels[li]) for li in range(L)],
-)
-
-_save_single_metric(
-    "metric_isolation_db_mean_allroi", "Isolation mean all-ROI (dB)",
-    "Mode isolation (mean, all ROIs) vs. layers",
-    lambda ax: [ax.plot(layer_counts, M_iso_mean_all[:, li], marker="o",
-                        color=cmap_wl[li], label=wl_labels[li]) for li in range(L)],
-)
-
-_save_single_metric(
-    "metric_isolation_db_worst_allroi", "Isolation worst all-ROI (dB)",
-    "Mode isolation (worst-case, all ROIs) vs. layers",
-    lambda ax: [ax.plot(layer_counts, M_iso_wc_all[:, li], marker="s", linestyle="--",
-                        color=cmap_wl[li], label=wl_labels[li]) for li in range(L)],
-)
-
-_save_single_metric(
-    "metric_target_wl_ratio", "TargetWL / AllWL (ROI)",
-    "Wavelength-demux ratio vs. layers",
-    lambda ax: [ax.plot(layer_counts, M_target_wl[:, li], marker="o",
-                        color=cmap_wl[li], label=wl_labels[li]) for li in range(L)],
-)
-M_wl_iso_mean = np.vstack([wl_iso_mean_per_layer[nl] for nl in sorted_layers])  # (NL, L)
-M_wl_iso_wc   = np.vstack([wl_iso_wc_per_layer[nl]   for nl in sorted_layers])
-M_il_db       = np.vstack([il_db_per_layer[nl]       for nl in sorted_layers])
-M_il_db_std   = np.vstack([il_db_std_per_layer[nl]   for nl in sorted_layers])
-WL_CT_3d      = np.stack ([wl_crosstalk_per_layer[nl] for nl in sorted_layers], axis=0)  # (NL, L, L)
-
-# --- 图: Wavelength isolation (mean) ---
-_save_single_metric(
-    "metric_wavelength_isolation_db_mean", "λ-Isolation mean (dB)",
-    "Wavelength isolation (mean) vs. layers",
-    lambda ax: [ax.plot(layer_counts, M_wl_iso_mean[:, li], marker="o",
-                        color=cmap_wl[li], label=wl_labels[li]) for li in range(L)],
-)
-
-# --- 图: Wavelength isolation (worst case) ---
-_save_single_metric(
-    "metric_wavelength_isolation_db_worst", "λ-Isolation worst (dB)",
-    "Wavelength isolation (worst-case) vs. layers",
-    lambda ax: [ax.plot(layer_counts, M_wl_iso_wc[:, li], marker="s", linestyle="--",
-                        color=cmap_wl[li], label=wl_labels[li]) for li in range(L)],
-)
-
-# --- 图: Insertion Loss per λ (with errorbars across modes) ---
-def _plot_il(ax):
-    for li in range(L):
-        ax.errorbar(layer_counts, M_il_db[:, li], yerr=M_il_db_std[:, li],
-                    marker="o", capsize=3, color=cmap_wl[li],
-                    label=wl_labels[li], linewidth=2)
-_save_single_metric(
-    "metric_insertion_loss_db", "Insertion Loss (dB)",
-    r"Overall Insertion Loss per λ "
-    r"$\mathrm{IL}=-10\log_{10}\langle E_\mathrm{out}/E_\mathrm{in}\rangle_\mathrm{modes}$",
-    _plot_il,
-)
-
-# 汇总 .mat
-metrics_mat_path = metrics_dir / f"metrics_vs_layers_{tag}.mat"
-savemat(
-    str(metrics_mat_path),
-    {
-        "layers":          layer_counts.astype(np.float64),
-        "wavelengths_m":   wavelengths.astype(np.float64),
-        "wavelengths_nm":  (wavelengths * 1e9).astype(np.float64),
-
-        "avg_amp_error":          M_amp_err,
-        "avg_relative_amp_error": M_rel_err,
-        "cc_amp_mean":            M_cc_mean,
-        "cc_amp_std":             M_cc_std,
-
-        "snr_db_full":               M_snr_db,
-        "isolation_db_mean":         M_iso_mean,
-        "isolation_db_worst":        M_iso_wc,
-        "isolation_db_mean_allroi":  M_iso_mean_all,
-        "isolation_db_worst_allroi": M_iso_wc_all,
-
-        "target_wl_ratio":           M_target_wl,
-        "crosstalk_matrix":      CT_4d,        # (NL, L, M, M)
-        "crosstalk_matrix_full": CT_full_4d,   # (NL, L, M, M*L)
-        # --- 新增:λ-isolation / IL ---
-        "wl_isolation_db_mean":   M_wl_iso_mean,    # (NL, L)
-        "wl_isolation_db_worst":  M_wl_iso_wc,      # (NL, L)
-        "wl_crosstalk_matrix":    WL_CT_3d,         # (NL, L, L)
-        "insertion_loss_db":      M_il_db,          # (NL, L)
-        "insertion_loss_db_std":  M_il_db_std,      # (NL, L)
-
-    },
-)
-print(f"  ✔ Metrics .mat -> {metrics_mat_path}")
-
-# Crosstalk 热力图
-ct_dir = metrics_dir / "crosstalk_heatmaps"
-ct_dir.mkdir(parents=True, exist_ok=True)
-for li_idx, n_layer in enumerate(layer_counts):
-    for wl_idx in range(L):
-        mat = CT_4d[li_idx, wl_idx]
-        mat_db = 10.0 * np.log10(np.clip(mat, 1e-6, None))
-
-        # linear
-        fig, ax = plt.subplots(figsize=(5.5, 5))
-        im = ax.imshow(mat, cmap="viridis", vmin=0, vmax=1)
-        ax.set_title(f"Crosstalk (linear) — {n_layer} layers, λ={wl_nm[wl_idx]:.0f}nm")
-        ax.set_xlabel("Detector index"); ax.set_ylabel("Input mode index")
-        ax.set_xticks(range(num_modes)); ax.set_yticks(range(num_modes))
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="energy fraction")
-        for r in range(num_modes):
-            for c in range(num_modes):
-                v = mat[r, c]
-                if np.isfinite(v):
-                    ax.text(c, r, f"{v:.2f}", ha="center", va="center",
-                            color=("white" if v < 0.5 else "black"), fontsize=8)
-        fig.tight_layout()
-        fig.savefig(ct_dir / f"crosstalk_linear_L{n_layer}_wl{wl_idx:02d}_{tag}.png",
-                    dpi=300, bbox_inches="tight")
-        plt.close(fig)
-
-        # dB
-        fig, ax = plt.subplots(figsize=(5.5, 5))
-        im = ax.imshow(mat_db, cmap="magma", vmin=-30, vmax=0)
-        ax.set_title(f"Crosstalk (dB) — {n_layer} layers, λ={wl_nm[wl_idx]:.0f}nm")
-        ax.set_xlabel("Detector index"); ax.set_ylabel("Input mode index")
-        ax.set_xticks(range(num_modes)); ax.set_yticks(range(num_modes))
-        fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="dB")
-        for r in range(num_modes):
-            for c in range(num_modes):
-                v = mat_db[r, c]
-                if np.isfinite(v):
-                    ax.text(c, r, f"{v:.0f}", ha="center", va="center",
-                            color=("white" if v < -15 else "black"), fontsize=8)
-        fig.tight_layout()
-        fig.savefig(ct_dir / f"crosstalk_db_L{n_layer}_wl{wl_idx:02d}_{tag}.png",
-                    dpi=300, bbox_inches="tight")
-        plt.close(fig)
-
-print(f"  ✔ Crosstalk heatmaps -> {ct_dir}")
 print("\n✅ All outputs saved successfully!")
-# λ-λ Crosstalk 热力图 (每个 num_layer 一张)
-wl_ct_dir = metrics_dir / "wavelength_crosstalk_heatmaps"
-wl_ct_dir.mkdir(parents=True, exist_ok=True)
-for li_idx, n_layer in enumerate(layer_counts):
-    R = WL_CT_3d[li_idx]                          # (L, L)
-    R_db = 10.0 * np.log10(np.clip(R, 1e-6, None))
-
-    fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
-
-    im0 = axes[0].imshow(R, cmap="viridis", vmin=0, vmax=1)
-    axes[0].set_title(f"λ-Crosstalk (linear) — {n_layer} layers")
-    axes[0].set_xlabel("ROI wavelength index"); axes[0].set_ylabel("Source wavelength index")
-    axes[0].set_xticks(range(L)); axes[0].set_yticks(range(L))
-    axes[0].set_xticklabels([f"{w:.0f}nm" for w in wl_nm], rotation=30, ha="right")
-    axes[0].set_yticklabels([f"{w:.0f}nm" for w in wl_nm])
-    fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
-    for r in range(L):
-        for c in range(L):
-            axes[0].text(c, r, f"{R[r, c]:.2f}",
-                         ha="center", va="center",
-                         color=("white" if R[r, c] < 0.5 else "black"), fontsize=9)
-
-    im1 = axes[1].imshow(R_db, cmap="magma", vmin=-30, vmax=0)
-    axes[1].set_title(f"λ-Crosstalk (dB) — {n_layer} layers")
-    axes[1].set_xlabel("ROI wavelength index"); axes[1].set_ylabel("Source wavelength index")
-    axes[1].set_xticks(range(L)); axes[1].set_yticks(range(L))
-    axes[1].set_xticklabels([f"{w:.0f}nm" for w in wl_nm], rotation=30, ha="right")
-    axes[1].set_yticklabels([f"{w:.0f}nm" for w in wl_nm])
-    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
-    for r in range(L):
-        for c in range(L):
-            axes[1].text(c, r, f"{R_db[r, c]:.0f}",
-                         ha="center", va="center",
-                         color=("white" if R_db[r, c] < -15 else "black"), fontsize=9)
-
-    fig.tight_layout()
-    fig.savefig(wl_ct_dir / f"wavelength_crosstalk_L{n_layer}_{tag}.png",
-                dpi=300, bbox_inches="tight")
-    plt.close(fig)
-
-print(f"  ✔ Wavelength crosstalk heatmaps -> {wl_ct_dir}")
