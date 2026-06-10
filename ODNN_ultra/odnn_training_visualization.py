@@ -12,7 +12,56 @@ from scipy.io import savemat
 from odnn_training_eval import forward_full_intensity, spot_energy_ratios_circle
 from odnn_model import complex_crop, complex_pad, propagation
 from odnn_processing import pad_field_to_layer
+from datetime import datetime  # for save_detection_overlap_debug timestamp
+from matplotlib.patches import Rectangle  # for save_detection_overlap_debug
 
+# ============================================================
+# Helper: 把 (H_slm, W_slm) 的 complex field 居中零填充到 out_size 画布
+# 用于支持 D2NNModel 中 out_size > layer_size 的情形。
+# 当 model 没有 out_size 字段或两者相等时，原样返回。
+# ============================================================
+def _embed_field_to_out_canvas(
+    field_2d: torch.Tensor,
+    model: torch.nn.Module,
+) -> torch.Tensor:
+    """field_2d: (H, W) complex；返回 (out_size, out_size) complex。"""
+    if not hasattr(model, "out_size") or not hasattr(model, "layer_size"):
+        return field_2d
+    out_size = int(model.out_size)
+    layer_size = int(model.layer_size)
+    if out_size == layer_size:
+        return field_2d
+
+    H, W = field_2d.shape[-2], field_2d.shape[-1]
+    if H == out_size and W == out_size:
+        return field_2d  # 已经是大画布
+    if H != layer_size or W != layer_size:
+        # 安全兜底：大小不符预期就居中填充到 out_size
+        pass
+
+    diff_h = out_size - H
+    diff_w = out_size - W
+    pt = diff_h // 2; pb = diff_h - pt
+    pl = diff_w // 2; pr = diff_w - pl
+    from odnn_model import complex_pad_asymm
+    return complex_pad_asymm(field_2d, pt, pb, pl, pr)
+
+
+def _embed_field_b1hw_to_out_canvas(
+    field_b1hw: torch.Tensor,
+    model: torch.nn.Module,
+) -> torch.Tensor:
+    """同上但接受 (B,1,H,W)。"""
+    if not hasattr(model, "out_size") or not hasattr(model, "layer_size"):
+        return field_b1hw
+    out_size = int(model.out_size)
+    layer_size = int(model.layer_size)
+    if out_size == layer_size:
+        return field_b1hw
+
+    plane = field_b1hw.squeeze(1).squeeze(0)   # 2D
+    plane = _embed_field_to_out_canvas(plane, model)
+    return plane.unsqueeze(0).unsqueeze(0)
 
 def _overlay_detector_masks(
     ax,
@@ -45,7 +94,6 @@ def _overlay_detector_masks(
         )
         circle.set_clip_on(True)
         ax.add_patch(circle)
-
 
 def plot_reconstruction_vs_input(
     image_test_data: torch.Tensor,
@@ -119,7 +167,6 @@ def plot_reconstruction_vs_input(
     plt.savefig(save_path, dpi=300)
     plt.close(fig)
     print("✔ Saved:", Path(save_path).resolve())
-
 
 def save_superposition_visuals(
     label_map: torch.Tensor,
@@ -221,7 +268,6 @@ def save_superposition_visuals(
         "predicted_weights": predicted_weights,
         "label_weights": label_weights,
     }
-
 
 @torch.no_grad()
 def plot_sys_vs_label_strict(
@@ -342,7 +388,6 @@ def plot_sys_vs_label_strict(
     plt.savefig(save_path, dpi=300)
     plt.close(fig)
     print("✔ Saved:", Path(save_path).resolve())
-
 
 def plot_sys_vs_label_strict_separate_scale(
     model: torch.nn.Module,
@@ -574,7 +619,6 @@ def plot_propagated_field_padded(
 
     return fields, z_values
 
-
 def plot_amplitude_comparison_grid(
     image_test_data: torch.Tensor,
     reconstructed_images: np.ndarray,
@@ -618,7 +662,6 @@ def plot_amplitude_comparison_grid(
     plt.savefig(save_path, dpi=300)
     plt.close(fig)
     print("✔ Saved:", Path(save_path).resolve())
-
 
 def visualize_model_slices(
     model: torch.nn.Module,
@@ -701,6 +744,9 @@ def visualize_model_slices(
         field = layer._propagate(field, layer.kz_pad, z_layers)
         field = complex_crop(field, layer.units, layer.units, pad, pad)
 
+    # ★ scan_to_camera 段在 out_size 大画布上做（model.propagation.units = out_size）
+    field = _embed_field_to_out_canvas(field, model)
+
     scan_stack2, scan_z2 = plot_propagated_field_padded(
         field,
         z_start=0.0,
@@ -719,14 +765,15 @@ def visualize_model_slices(
         "z": scan_z2.copy(),
     }
 
+    # ★ 最终相机面也用 out_size 网格
     prop = model.propagation
     pad_cam = int(prop.pad_px)
+    cam_units = int(prop.units)         # = out_size
     field_cam = complex_pad(field, pad_cam, pad_cam)
     field_cam = prop._propagate(field_cam, prop.kz_pad, prop.z)
-    field_cam = complex_crop(field_cam, model.layers[0].units, model.layers[0].units, pad_cam, pad_cam)
+    field_cam = complex_crop(field_cam, cam_units, cam_units, pad_cam, pad_cam)
 
     return scans, field_cam.detach().cpu().numpy()
-
 
 @torch.no_grad()
 def capture_eigenmode_propagation(
@@ -744,9 +791,12 @@ def capture_eigenmode_propagation(
     tag: str,
     fractions_between_layers: Sequence[Sequence[float]] | None = None,
     output_fractions: Sequence[float] | None = None,
-) -> dict[str, str]:
+) -> dict[str, object]:
     """
     Capture specific propagation snapshots for a given eigenmode input and save plots/data.
+
+    NEW: also computes & plots remaining energy at each LAYER plane:
+         input_plane / layer{k}_arrival / after_last_layer / output_field
     """
     device = next(model.parameters()).device
     model.eval()
@@ -782,6 +832,15 @@ def capture_eigenmode_propagation(
     def tensor_to_np(field_tensor: torch.Tensor) -> np.ndarray:
         field_cpu = field_tensor.detach().squeeze().to("cpu").numpy()
         return np.asarray(field_cpu, dtype=np.complex64)
+
+    # ★ 新增：用于 stack 前的统一尺寸
+    def pad_np_to(arr: np.ndarray, target: int) -> np.ndarray:
+        H, W = arr.shape[-2], arr.shape[-1]
+        if H == target and W == target:
+            return arr
+        diff_h = target - H; pt = diff_h // 2; pb = diff_h - pt
+        diff_w = target - W; pl = diff_w // 2; pr = diff_w - pl
+        return np.pad(arr, ((pt, pb), (pl, pr)), mode="constant", constant_values=0)
 
     def add_record(key: str, description: str, field_tensor: torch.Tensor, z_value: float) -> None:
         records.append(
@@ -881,6 +940,9 @@ def capture_eigenmode_propagation(
         next_field = output_plane.unsqueeze(0).unsqueeze(0)
         return next_field, current_z
 
+    # ----------------------------
+    # forward sweep with snapshots
+    # ----------------------------
     current_z = 0.0
     add_record(
         key="input_plane",
@@ -900,17 +962,25 @@ def capture_eigenmode_propagation(
 
     for layer_idx, layer in enumerate(model.layers):
         fractions = fractions_between_layers[layer_idx] if layer_idx < len(fractions_between_layers) else ()
-        stage_label = f"L{layer_idx + 1}_to_L{layer_idx + 2}" if layer_idx < num_layers - 1 else f"L{layer_idx + 1}_internal"
+        stage_label = (
+            f"L{layer_idx + 1}_to_L{layer_idx + 2}" if layer_idx < num_layers - 1
+            else f"L{layer_idx + 1}_internal"
+        )
         field, current_z = propagate_through_layer(field, layer, fractions, stage_label, current_z)
         arrival_label = (
             f"layer{layer_idx + 2}_arrival" if layer_idx < num_layers - 1 else "after_last_layer"
         )
         add_record(
             key=arrival_label,
-            description=f"Arrival at layer {layer_idx + 2}" if layer_idx < num_layers - 1 else "After last layer",
+            description=(
+                f"Arrival at layer {layer_idx + 2}" if layer_idx < num_layers - 1 else "After last layer"
+            ),
             field_tensor=field,
             z_value=current_z,
         )
+
+    # ★★★ 关键：进入 out_size 大画布 ★★★
+    field = _embed_field_b1hw_to_out_canvas(field, model)
 
     field, current_z = propagate_module(field, model.propagation, output_fractions, "layers_to_output", current_z)
     add_record(
@@ -922,7 +992,14 @@ def capture_eigenmode_propagation(
 
     output_intensity = model.regression(field).squeeze(0).squeeze(0).detach().cpu().numpy().astype(np.float32)
 
-    intensity_stack = np.stack([np.abs(rec["field"]) ** 2 for rec in records], axis=0)
+    # ----------------------------
+    # overview figure (existing)
+    # ----------------------------
+    # ★ 把所有 record 统一 pad 到 out_size，再 stack
+    target_size = int(getattr(model, "out_size", layer_size))
+    fields_aligned = [pad_np_to(rec["field"], target_size) for rec in records]
+    intensity_stack = (np.abs(np.stack(fields_aligned, axis=0)) ** 2).astype(np.float32)
+
     vmax = float(np.percentile(intensity_stack, 99.5))
     if not np.isfinite(vmax) or vmax <= 0:
         vmax_candidate = float(np.max(intensity_stack)) if intensity_stack.size else 0.0
@@ -936,10 +1013,12 @@ def capture_eigenmode_propagation(
     last_im = None
 
     for idx, rec in enumerate(records):
-        im = axes[idx].imshow(np.abs(rec["field"]) ** 2, cmap="inferno", vmin=0, vmax=vmax)
+        img = pad_np_to(rec["field"], target_size)
+        im = axes[idx].imshow(np.abs(img) ** 2, cmap="inferno", vmin=0, vmax=vmax)   # ★ 改用 img
         axes[idx].set_title(f"{idx + 1}. {rec['description']}", fontsize=8)
         axes[idx].axis("off")
         last_im = im
+        
     for idx in range(num_records, len(axes)):
         axes[idx].axis("off")
 
@@ -947,15 +1026,70 @@ def capture_eigenmode_propagation(
         fig.colorbar(last_im, ax=axes[:num_records], fraction=0.025, pad=0.02)
 
     fig.suptitle(f"Propagation snapshots | mode {mode_index + 1}")
-    #plt.tight_layout(rect=[0, 0, 1, 0.97])
     fig_path = output_dir / f"propagation_mode{mode_index + 1}_{tag}.png"
     fig.savefig(fig_path, dpi=300)
     plt.close(fig)
 
+    # ============================================================
+    # NEW: energy at each LAYER plane
+    # Pick: input_plane / layer{k}_arrival / after_last_layer / output_field
+    # ============================================================
+    wanted_keys = ["input_plane"] \
+        + [f"layer{k+1}_arrival" for k in range(num_layers)] \
+        + ["after_last_layer", "output_field"]
+
+    plane_records: list[dict[str, object]] = []
+    for k in wanted_keys:
+        for r in records:
+            if r["key"] == k:
+                plane_records.append(r)
+                break
+
+    # 每个平面的总能量
+    energy_planes = np.array(
+        [float((np.abs(r["field"]) ** 2).sum()) for r in plane_records],
+        dtype=np.float64,
+    )                                                                # (Nplanes,)
+
+    E0 = float(energy_planes[0]) if energy_planes.size > 0 else 0.0
+    energy_planes_norm = energy_planes / (E0 if E0 > 0 else 1.0)     # (Nplanes,)
+
+    plane_keys = [r["key"] for r in plane_records]
+    plane_z_m = np.array([r["z"] for r in plane_records], dtype=np.float64)
+
+    # 折线图
+    fig_e, ax_e = plt.subplots(figsize=(max(7.0, 0.9 * len(plane_keys)), 4.5))
+    xs = np.arange(len(plane_keys))
+    ax_e.plot(xs, energy_planes_norm, marker="o",
+              color="tab:blue", label=f"λ={wavelength*1e9:.1f} nm")
+    ax_e.set_xticks(xs)
+    ax_e.set_xticklabels(plane_keys, rotation=30, ha="right", fontsize=8)
+    ax_e.set_ylabel("Energy (normalized to input)")
+    ax_e.set_title(f"Energy at each layer plane | mode {mode_index+1}")
+    ax_e.grid(True, alpha=0.3)
+    ax_e.set_ylim(bottom=0.0)
+    ax_e.legend(fontsize=9, loc="best")
+    fig_e.tight_layout()
+    energy_fig_path = output_dir / f"energy_at_layers_mode{mode_index + 1}_{tag}.png"
+    fig_e.savefig(energy_fig_path, dpi=250, bbox_inches="tight")
+    plt.close(fig_e)
+
+    # 终端打印一份表格
+    print(f"\n[Energy at each plane | mode {mode_index+1} | tag={tag}]")
+    print(f"  {'plane':<20s} {'z(mm)':>8s} {'E_abs':>14s} {'E_rel(%)':>12s}")
+    for i, k in enumerate(plane_keys):
+        print(
+            f"  {k:<20s} {plane_z_m[i]*1e3:>8.2f} "
+            f"{energy_planes[i]:>14.4e} {energy_planes_norm[i]*100:>11.2f}"
+        )
+
+    # ----------------------------
+    # MAT export (existing + new)
+    # ----------------------------
     slice_names = np.array([rec["key"] for rec in records], dtype=object)
     slice_descriptions = np.array([rec["description"] for rec in records], dtype=object)
     z_positions = np.array([rec["z"] for rec in records], dtype=np.float64)
-    field_stack = np.stack([rec["field"] for rec in records], axis=0).astype(np.complex64)
+    field_stack = np.stack(fields_aligned, axis=0).astype(np.complex64)
     energy_trace = intensity_stack.reshape(intensity_stack.shape[0], -1).sum(axis=1).astype(np.float64)
 
     mat_path = output_dir / f"propagation_mode{mode_index + 1}_{tag}.mat"
@@ -976,6 +1110,12 @@ def capture_eigenmode_propagation(
             "z_input_to_first": np.array([z_input_to_first], dtype=np.float64),
             "z_layers": np.array([z_layers], dtype=np.float64),
             "z_prop": np.array([z_prop], dtype=np.float64),
+
+            # ---- new: per-layer energy bookkeeping ----
+            "plane_keys":          np.array(plane_keys, dtype=object),
+            "plane_z_m":           plane_z_m,
+            "energy_at_planes":      energy_planes,           # (Nplanes,)
+            "energy_at_planes_norm": energy_planes_norm,      # (Nplanes,) normalized to input
         },
     )
 
@@ -983,12 +1123,16 @@ def capture_eigenmode_propagation(
         model.train()
 
     return {
-        "fig_path": str(fig_path),
-        "mat_path": str(mat_path),
-        "energies": energy_trace,
-        "z_positions": z_positions,
+        "fig_path":         str(fig_path),
+        "mat_path":         str(mat_path),
+        "energy_fig_path":  str(energy_fig_path),
+        "energies":         energy_trace,
+        "z_positions":      z_positions,
+        "plane_keys":       plane_keys,
+        "plane_z_m":        plane_z_m,
+        "energy_at_planes":      energy_planes,
+        "energy_at_planes_norm": energy_planes_norm,
     }
-
 
 @torch.no_grad()
 def save_mode_triptych(
@@ -1003,6 +1147,7 @@ def save_mode_triptych(
     evaluation_regions: Sequence[Tuple[int, int, int, int]] | None = None,
     detect_radius: int | None = None,
     show_mask_overlays: bool = False,
+    overlay_on_input: bool = False,
 ) -> dict[str, str]:
     """
     Save a triptych (input, model output, label) for a specific eigenmode and export data to MAT.
@@ -1022,13 +1167,42 @@ def save_mode_triptych(
     input_intensity = torch.abs(padded_field).square().detach().cpu().numpy().astype(np.float32)
     label_np = label_field.detach().cpu().numpy().astype(np.float32)
 
+    # ★ 大画布对齐：output 与 label 在 out_size 画布上，input 仍在 SLM 画布上 → 居中填充
+    out_h, out_w = output_intensity.shape[-2], output_intensity.shape[-1]
+    in_h, in_w   = input_intensity.shape[-2],  input_intensity.shape[-1]
+    if (in_h, in_w) != (out_h, out_w):
+        diff_h = out_h - in_h
+        diff_w = out_w - in_w
+        pt = diff_h // 2; pb = diff_h - pt
+        pl = diff_w // 2; pr = diff_w - pl
+        input_intensity = np.pad(
+            input_intensity,
+            ((pt, pb), (pl, pr)),
+            mode="constant",
+            constant_values=0.0,
+        )
+
+    # label 一般已经是 out_size；做一个对称的兜底
+    lab_h, lab_w = label_np.shape[-2], label_np.shape[-1]
+    if (lab_h, lab_w) != (out_h, out_w):
+        diff_h = out_h - lab_h
+        diff_w = out_w - lab_w
+        pt = diff_h // 2; pb = diff_h - pt
+        pl = diff_w // 2; pr = diff_w - pl
+        label_np = np.pad(
+            label_np,
+            ((pt, pb), (pl, pr)),
+            mode="constant",
+            constant_values=0.0,
+        )
+
     vmax = float(np.max([input_intensity.max(), output_intensity.max(), label_np.max(), 1e-8]))
 
     fig, axes = plt.subplots(1, 3, figsize=(12, 4))
     im0 = axes[0].imshow(input_intensity, cmap="inferno", vmin=0, vmax=vmax)
     axes[0].set_title(f"Mode {mode_index + 1} Input")
     axes[0].axis("off")
-    if show_mask_overlays:
+    if show_mask_overlays and overlay_on_input:
         _overlay_detector_masks(axes[0], evaluation_regions, detect_radius)
 
     im1 = axes[1].imshow(output_intensity, cmap="inferno", vmin=0, vmax=vmax)
@@ -1055,19 +1229,19 @@ def save_mode_triptych(
     savemat(
         str(mat_path),
         {
-            "mode_index": np.array([mode_index + 1], dtype=np.int32),
-            "input_field": padded_field.detach().cpu().numpy().astype(np.complex64),
-            "input_intensity": input_intensity,
-            "model_output": output_intensity,
-            "label": label_np,
+            "mode_index":      np.array([mode_index + 1], dtype=np.int32),
+            "input_field":     padded_field.detach().cpu().numpy().astype(np.complex64),  # SLM 网格
+            "input_intensity": input_intensity,            # ★ 现在是 out_size 画布
+            "model_output":    output_intensity,           # out_size 画布
+            "label":           label_np,                   # out_size 画布
         },
     )
+
 
     if was_training:
         model.train()
 
     return {"fig_path": str(fig_path), "mat_path": str(mat_path)}
-
 
 @torch.no_grad()
 def save_superposition_triptych(
@@ -1213,7 +1387,6 @@ def save_superposition_triptych(
     )
 
     return {"fig_path": fig_path_str, "mat_path": str(mat_path)}
-
 
 def export_superposition_slices(
     model: torch.nn.Module,
@@ -1480,14 +1653,12 @@ def capture_eigenmode_propagation_multiwl(
     base_wavelength_idx: int = 0,
     fractions_between_layers: Sequence[Sequence[float]] | None = None,
     output_fractions: Sequence[float] | None = None,
-) -> dict[str, object]:
+) -> dict[str, str]:
     """
     MultiWL version (dense snapshots supported):
     - records: input, arrival before L1, per-layer propagation snapshots, after last layer, output plane
     - figure: show base_wavelength_idx only (to avoid huge figure)
     - mat: save ALL wavelengths complex fields/intensities: fields(K,L,H,W)
-    - NEW: also computes & plots remaining energy at each LAYER plane (per-λ + total),
-           and saves the values into the .mat file.
     """
     device = next(model.parameters()).device
     model.eval()
@@ -1510,12 +1681,13 @@ def capture_eigenmode_propagation_multiwl(
 
     num_layers = len(layers)
     if fractions_between_layers is None:
+        # mimic your single-wl defaults: internal points for each layer segment, last can be ()
         default: list[tuple[float, ...]] = []
         for li in range(num_layers):
             if li < num_layers - 1:
                 default.append((1.0 / 3.0, 2.0 / 3.0))
             else:
-                default.append((1.0 / 3.0, 2.0 / 3.0))
+                default.append((1.0 / 3.0, 2.0 / 3.0))  # last layer segment too (feel free to make () )
         fractions_between_layers = tuple(default)
 
     if output_fractions is None:
@@ -1545,6 +1717,7 @@ def capture_eigenmode_propagation_multiwl(
         stage_label: str,
         z_base: float,
     ) -> torch.Tensor:
+        # use sorted unique fractions within (0,1)
         fr = [float(f) for f in fractions]
         fr = [f for f in fr if 0.0 < f < 1.0]
         fr = sorted(set(fr))
@@ -1579,12 +1752,13 @@ def capture_eigenmode_propagation_multiwl(
     # layers: (mask) + (prop with snapshots)
     # ----------------------------
     for li, layer in enumerate(layers):
+        # apply scaled mask (same as your multiwl layer)
         lam0 = layer.lam0.to(device=device)
         wl_buf = layer.wavelengths.to(device=device)
         scale = (lam0 / wl_buf)  # (L,)
 
         phi0 = layer.phase.to(device=device, dtype=torch.float32)      # (H,W)
-        phi = phi0[None, :, :] * scale[:, None, None]                  # (L,H,W)
+        phi = phi0[None, :, :] * scale[:, None, None]                 # (L,H,W)
         phase_c = torch.exp(1j * phi).to(torch.complex64)              # (L,H,W)
 
         field = field * phase_c[None, ...]
@@ -1627,153 +1801,36 @@ def capture_eigenmode_propagation_multiwl(
     # detector intensity (full L)
     output_intensity = (field.abs() ** 2)[0].detach().cpu().numpy().astype(np.float32)  # (L,H,W)
 
-    # =========================================================
-    # Overview figure: rows = snapshots, cols = wavelengths
-    # (所有波长并列显示，便于比较)
-    # =========================================================
+    # --- overview figure using base_wavelength_idx only
     base_idx = int(np.clip(base_wavelength_idx, 0, L - 1))
-
-    # 全局 vmax（基于全部 λ 的 99.5 百分位）—— 让不同 λ 颜色尺度一致
-    intensity_all = np.stack(
-        [np.abs(r["field"]) ** 2 for r in records], axis=0
-    )  # (K, L, H, W)
-    vmax_global = float(np.percentile(intensity_all, 99.5))
-    if (not np.isfinite(vmax_global)) or vmax_global <= 0:
-        vmax_global = float(intensity_all.max() if intensity_all.size else 1.0)
-
-    # 每个 record 自己的 vmax（按行共享 vmax，跨 λ 对比同一传播位置的亮度差异）
-    vmax_per_record = np.array(
-        [float(np.percentile(intensity_all[k], 99.5)) for k in range(len(records))],
-        dtype=np.float64,
-    )
-    vmax_per_record = np.where(
-        np.isfinite(vmax_per_record) & (vmax_per_record > 0),
-        vmax_per_record,
-        vmax_global,
-    )
+    intensity_stack_base = np.stack([np.abs(r["field"][base_idx]) ** 2 for r in records], axis=0)  # (K,H,W)
+    vmax = float(np.percentile(intensity_stack_base, 99.5))
+    vmax = vmax if np.isfinite(vmax) and vmax > 0 else float(np.max(intensity_stack_base) if intensity_stack_base.size else 1.0)
 
     K = len(records)
-    nrows = K
-    ncols = L
-
-    # 控制每个 panel 的物理大小，避免 L 较大时图过宽
-    panel_w = 3.0
-    panel_h = 3.0
-    fig, axes = plt.subplots(
-        nrows, ncols,
-        figsize=(panel_w * ncols + 1.0, panel_h * nrows),
-        squeeze=False,
-    )
+    ncols = 4
+    nrows = (K + ncols - 1) // ncols
+    fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.0 * nrows))
+    axes = np.array(axes).reshape(-1)
 
     last_im = None
     for i, rec in enumerate(records):
-        # 你可以在这里切换 vmax 策略：
-        #   row_vmax  = vmax_per_record[i]   # 行内（同一传播位置）跨 λ 比较
-        row_vmax  = vmax_global          # 全图统一刻度
-        # row_vmax = vmax_per_record[i]
+        im = axes[i].imshow(np.abs(rec["field"][base_idx]) ** 2, cmap="inferno", vmin=0, vmax=vmax)
+        axes[i].set_title(f"{i+1}. {rec['description']}", fontsize=8)
+        axes[i].axis("off")
+        last_im = im
+    for i in range(K, len(axes)):
+        axes[i].axis("off")
 
-        for li in range(L):
-            ax = axes[i, li]
-            I_li = np.abs(rec["field"][li]) ** 2
-            im = ax.imshow(I_li, cmap="inferno", vmin=0, vmax=row_vmax)
-            wl_nm = float(wavelengths[li]) * 1e9
-            tag_base = " (base)" if li == base_idx else ""
-            ax.set_title(
-                f"{i+1}. {rec['description']}\nλ={wl_nm:.1f} nm{tag_base}",
-                fontsize=8,
-            )
-            ax.axis("off")
-            last_im = im
+    if last_im is not None:
+        fig.colorbar(last_im, ax=axes[:K], fraction=0.025, pad=0.02)
 
-        # 每行右侧加一个 colorbar（共享该行的 vmax）
-        cbar = fig.colorbar(
-            last_im, ax=axes[i, :].tolist(),
-            fraction=0.025, pad=0.01,
-        )
-        cbar.ax.tick_params(labelsize=7)
-
-    fig.suptitle(
-        f"MultiWL propagation snapshots | mode {mode_index+1} | "
-        f"all {L} wavelengths side-by-side",
-        fontsize=12,
-    )
+    fig.suptitle(f"MultiWL propagation snapshots | mode {mode_index+1} | base λ idx={base_idx}")
     fig_path = output_dir / f"propagation_multiwl_mode{mode_index+1}_{tag}.png"
-    fig.savefig(fig_path, dpi=300, bbox_inches="tight")
+    fig.savefig(fig_path, dpi=300)
     plt.close(fig)
 
-
-    # =========================================================
-    # NEW: energy at each LAYER plane
-    # Only pick layer planes: input / arrive_Lk / after_last_layer / output_plane
-    # =========================================================
-    wanted_keys = ["input"] \
-                + [f"arrive_L{k+1}" for k in range(num_layers)] \
-                + ["after_last_layer", "output_plane"]
-
-    plane_records: list[dict[str, Any]] = []
-    for k in wanted_keys:
-        for r in records:
-            if r["key"] == k:
-                plane_records.append(r)
-                break
-
-    # per-λ + total energy
-    energy_planes_per_wl = np.stack(
-        [(np.abs(r["field"]) ** 2).reshape(L, -1).sum(axis=1) for r in plane_records],
-        axis=0,
-    ).astype(np.float64)                                          # (Nplanes, L)
-    energy_planes_total = energy_planes_per_wl.sum(axis=1)         # (Nplanes,)
-
-    # normalize to input
-    E0_wl = energy_planes_per_wl[0].copy()
-    E0_total = float(energy_planes_total[0])
-    E0_wl_safe = np.where(E0_wl > 0, E0_wl, 1.0)
-    energy_planes_per_wl_norm = energy_planes_per_wl / E0_wl_safe[None, :]
-    energy_planes_total_norm = energy_planes_total / (E0_total if E0_total > 0 else 1.0)
-
-    plane_keys = [r["key"] for r in plane_records]
-    plane_z_m = np.array([r["z"] for r in plane_records], dtype=np.float64)
-    wls_nm = (np.asarray(wavelengths, dtype=np.float64) * 1e9)
-
-    # plot
-    fig_e, ax_e = plt.subplots(figsize=(max(7.0, 0.9 * len(plane_keys)), 4.5))
-    xs = np.arange(len(plane_keys))
-    for li in range(L):
-        ax_e.plot(
-            xs, energy_planes_per_wl_norm[:, li],
-            marker="o", label=f"λ={wls_nm[li]:.1f} nm",
-        )
-    ax_e.plot(
-        xs, energy_planes_total_norm,
-        marker="s", linestyle="--", color="k", label="total (sum λ)",
-    )
-    ax_e.set_xticks(xs)
-    ax_e.set_xticklabels(plane_keys, rotation=30, ha="right", fontsize=8)
-    ax_e.set_ylabel("Energy (normalized to input)")
-    ax_e.set_title(f"Energy at each layer plane | mode {mode_index+1}")
-    ax_e.grid(True, alpha=0.3)
-    ax_e.set_ylim(bottom=0.0)
-    ax_e.legend(fontsize=9, loc="best")
-    fig_e.tight_layout()
-    energy_fig_path = output_dir / f"energy_at_layers_mode{mode_index+1}_{tag}.png"
-    fig_e.savefig(energy_fig_path, dpi=250, bbox_inches="tight")
-    plt.close(fig_e)
-
-    # console table
-    print(f"\n[Energy at each plane | mode {mode_index+1} | tag={tag}]")
-    header = f"  {'plane':<20s} {'z(mm)':>8s} " \
-             + " ".join([f"E_{wls_nm[li]:.1f}nm(%)".rjust(14) for li in range(L)]) \
-             + f" {'E_total(%)':>12s}"
-    print(header)
-    for i, k in enumerate(plane_keys):
-        row = f"  {k:<20s} {plane_z_m[i]*1e3:>8.2f} "
-        row += " ".join([f"{energy_planes_per_wl_norm[i, li]*100:>13.2f}" for li in range(L)])
-        row += f" {energy_planes_total_norm[i]*100:>11.2f}"
-        print(row)
-
-    # =========================================================
-    # MAT export (store all L) + new energy fields
-    # =========================================================
+    # --- MAT export (store all L)
     slice_names = np.array([r["key"] for r in records], dtype=object)
     slice_desc = np.array([r["description"] for r in records], dtype=object)
     z_positions = np.array([r["z"] for r in records], dtype=np.float64)
@@ -1800,278 +1857,241 @@ def capture_eigenmode_propagation_multiwl(
             "z_layers": np.array([z_layers], dtype=np.float64),
             "z_prop": np.array([z_prop], dtype=np.float64),
             "base_wavelength_idx": np.array([base_idx], dtype=np.int32),
-
-            # ---- new: per-layer energy bookkeeping ----
-            "plane_keys":                np.array(plane_keys, dtype=object),
-            "plane_z_m":                 plane_z_m,
-            "energy_planes_per_wl":      energy_planes_per_wl,         # (Nplanes, L)
-            "energy_planes_total":       energy_planes_total,          # (Nplanes,)
-            "energy_planes_per_wl_norm": energy_planes_per_wl_norm,    # (Nplanes, L)
-            "energy_planes_total_norm":  energy_planes_total_norm,     # (Nplanes,)
         },
     )
 
-    return {
-        "fig_path":        str(fig_path),
-        "mat_path":        str(mat_path),
-        "energy_fig_path": str(energy_fig_path),
-        "plane_keys":      plane_keys,
-        "plane_z_m":       plane_z_m,
-        "energy_planes_per_wl_norm": energy_planes_per_wl_norm,
-        "energy_planes_total_norm":  energy_planes_total_norm,
-    }
+    return {"fig_path": str(fig_path), "mat_path": str(mat_path)}
 
-@torch.no_grad()
-def save_mode_triptych_multiwl(
-    model: torch.nn.Module,
-    mode_index: int,
-    eigenmode_field: torch.Tensor,
-    label_field: torch.Tensor,
+
+# ============================================================
+# ★ NEW (#8): build_uniform_fractions —— 切片分数生成
+# ============================================================
+def build_uniform_fractions(count: int) -> tuple[float, ...]:
+    """
+    Generate `count` evenly spaced fractions in (0, 1), exclusive at both ends.
+    Used by capture_eigenmode_propagation as fractions_between_layers / output_fractions.
+
+    Examples:
+        build_uniform_fractions(0) -> ()
+        build_uniform_fractions(1) -> (0.5,)
+        build_uniform_fractions(3) -> (0.25, 0.5, 0.75)
+    """
+    if count <= 0:
+        return ()
+    fractions = np.linspace(1.0 / (count + 1), count / (count + 1), count, dtype=float)
+    return tuple(float(f) for f in fractions)
+
+
+# ============================================================
+# ★ NEW (#4): save_detection_overlap_debug —— 检测区布局诊断图
+# ============================================================
+def save_detection_overlap_debug(
     *,
-    layer_size: int,
-    wavelengths: np.ndarray,
+    evaluation_regions: Sequence[Tuple[int, int, int, int]],
+    detection_masks: np.ndarray | None,
+    label_data: torch.Tensor | None,
+    out_size: int,
+    focus_radius: int,
     output_dir: str | Path,
-    tag: str,
-    evaluation_regions: Sequence[Tuple[int, int, int, int]] | None = None,
-    detect_radius: int | None = None,
-    show_mask_overlays: bool = False,
-    overlay_on_input: bool = False,          # 默认 Input 不画圈
-    base_wavelength_idx: int = 0,            # 总览图里用哪一个 λ
-    per_wavelength_figs: bool = True,        # 是否另外给每个 λ 单独存一张三联图
-    per_wavelength_label: bool = False,      # 是否对每个 λ 的 label 也做缩放（默认共享同一 label）
-) -> dict[str, object]:
+    sample_idx: int = 0,
+    tag: str | None = None,
+) -> Path:
     """
-    Multi-wavelength triptych for one eigenmode.
-    - Saves a 'grid' figure: rows = wavelengths, columns = [Input, Output, Label]
-    - Optionally saves per-wavelength 3-panel PNG (same style as save_mode_triptych)
-    - Exports a MAT file with per-λ input/output intensities and label.
+    Render a side-by-side diagnostic of detector layout and coverage overlap.
+
+    Args:
+        evaluation_regions: list of (x0, x1, y0, y1) bounding boxes per detector.
+        detection_masks: optional (N, H, W) float array of per-detector masks
+            (used only in `mixed` label mode; pass None to use rectangular regions).
+        label_data: optional (B, 1, H, W) tensor; one sample is shown as the background.
+        out_size: square canvas side (pixels).
+        focus_radius: radius (in pixels) of the dashed reference circle drawn at each region center.
+        output_dir: where to save the PNG.
+        sample_idx: which sample of label_data to display.
+        tag: optional filename suffix; default = current timestamp.
+
+    Returns:
+        Path of the saved PNG.
     """
-    device = next(model.parameters()).device
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    was_training = model.training
-    model.eval()
-
-    # ---- input: (H,W) -> padded -> (1,L,H,W)
-    plane_hw = eigenmode_field.to(device=device, dtype=torch.complex64)
-    padded_field = pad_field_to_layer(plane_hw, layer_size)       # (H,W)
-    H, W = int(padded_field.shape[-2]), int(padded_field.shape[-1])
-    L = int(len(wavelengths))
-
-    input_batch = padded_field[None, None, ...].repeat(1, L, 1, 1).contiguous()  # (1,L,H,W)
-
-    # ---- forward (assumes D2NNModelMultiWL that takes (1,L,H,W) complex and returns intensity)
-    out = model(input_batch)                                       # (1,L,H,W) or (L,H,W)
-    if out.ndim == 4:
-        output_intensity = out[0].detach().cpu().numpy().astype(np.float32)  # (L,H,W)
+    # ---- compute overlap map ----
+    if detection_masks is not None:
+        overlap_map = np.sum(detection_masks > 0.5, axis=0).astype(np.float32)
     else:
-        output_intensity = out.detach().cpu().numpy().astype(np.float32)      # (L,H,W)
+        overlap_map = np.zeros((out_size, out_size), dtype=np.float32)
+        for (x0, x1, y0, y1) in evaluation_regions:
+            overlap_map[y0:y1, x0:x1] += 1.0
+    overlap_pixels = int(np.count_nonzero(overlap_map > 1.0 + 1e-6))
+    max_overlap = float(overlap_map.max()) if overlap_map.size else 0.0
 
-    # per-λ input intensity (for eigenmode input, all λ share the same amp^2)
-    input_intensity = (torch.abs(padded_field) ** 2).detach().cpu().numpy().astype(np.float32)  # (H,W)
+    # ---- sample to display behind the detector overlay ----
+    label_sample_np = None
+    if isinstance(label_data, torch.Tensor) and label_data.shape[0] > 0:
+        idx = min(max(0, int(sample_idx)), label_data.shape[0] - 1)
+        label_sample_np = label_data[idx, 0].detach().cpu().numpy()
 
-    # label
-    label_np = label_field.detach().cpu().numpy().astype(np.float32)                             # (H,W)
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
 
-    wls_nm = np.asarray(wavelengths, dtype=np.float64) * 1e9
-    base_idx = int(np.clip(base_wavelength_idx, 0, L - 1))
+    # ---- left panel: detector layout over (optional) label ----
+    if label_sample_np is not None:
+        im0 = axes[0].imshow(label_sample_np, cmap="inferno")
+        fig.colorbar(im0, ax=axes[0], fraction=0.046, pad=0.04)
+        axes[0].set_title(f"Label sample #{idx + 1} with detectors")
+    else:
+        axes[0].imshow(np.zeros((out_size, out_size), dtype=np.float32), cmap="Greys")
+        axes[0].set_title("Detector layout (no label sample)")
+    axes[0].set_axis_off()
 
-    # ---------- (A) GRID figure: rows = wavelengths, cols = [Input, Output, Label] ----------
-    fig, axes = plt.subplots(L, 3, figsize=(12, 4 * L), squeeze=False)
-    for li in range(L):
-        vmax = float(max(
-            input_intensity.max(),
-            output_intensity[li].max(),
-            label_np.max(),
-            1e-8,
-        ))
+    if detection_masks is not None:
+        for i, mask in enumerate(detection_masks):
+            color = plt.cm.tab20(i % 20)
+            axes[0].contour(mask, levels=[0.5], colors=[color], linewidths=1.0)
+            ys, xs = np.where(mask > 0.5)
+            if xs.size > 0:
+                axes[0].text(
+                    float(xs.mean()), float(ys.mean()),
+                    f"M{i + 1}",
+                    color=color, fontsize=8, weight="bold",
+                    ha="center", va="center",
+                    bbox=dict(boxstyle="round,pad=0.2", facecolor="black",
+                              alpha=0.4, edgecolor="none"),
+                )
+    else:
+        for i, (x0, x1, y0, y1) in enumerate(evaluation_regions):
+            color = plt.cm.tab20(i % 20)
+            axes[0].add_patch(Rectangle(
+                (x0, y0), x1 - x0, y1 - y0,
+                linewidth=1.0, edgecolor=color, facecolor="none",
+            ))
+            cx = (x0 + x1) / 2.0
+            cy = (y0 + y1) / 2.0
+            axes[0].add_patch(Circle(
+                (cx, cy), radius=focus_radius,
+                linewidth=1.0, edgecolor=color, linestyle="--", fill=False,
+            ))
+            axes[0].text(
+                x0 + 1, y0 + 4,
+                f"M{i + 1}",
+                color=color, fontsize=8, weight="bold",
+                ha="left", va="bottom",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="black",
+                          alpha=0.4, edgecolor="none"),
+            )
 
-        im0 = axes[li, 0].imshow(input_intensity, cmap="inferno", vmin=0, vmax=vmax)
-        axes[li, 0].set_title(f"Mode {mode_index+1} Input | λ={wls_nm[li]:.1f} nm")
-        axes[li, 0].axis("off")
-        if show_mask_overlays and overlay_on_input:
-            _overlay_detector_masks(axes[li, 0], evaluation_regions, detect_radius)
+    # ---- right panel: coverage overlap heatmap ----
+    im1 = axes[1].imshow(overlap_map, cmap="viridis")
+    fig.colorbar(im1, ax=axes[1], fraction=0.046, pad=0.04)
+    axes[1].set_title("Detector coverage count (overlap map)")
+    axes[1].set_axis_off()
 
-        im1 = axes[li, 1].imshow(output_intensity[li], cmap="inferno", vmin=0, vmax=vmax)
-        axes[li, 1].set_title(f"Model Output | λ={wls_nm[li]:.1f} nm")
-        axes[li, 1].axis("off")
-        if show_mask_overlays:
-            _overlay_detector_masks(axes[li, 1], evaluation_regions, detect_radius)
-
-        im2 = axes[li, 2].imshow(label_np, cmap="inferno", vmin=0, vmax=vmax)
-        axes[li, 2].set_title("Label")
-        axes[li, 2].axis("off")
-        if show_mask_overlays:
-            _overlay_detector_masks(axes[li, 2], evaluation_regions, detect_radius)
-
-        for ax, im in zip(axes[li], [im0, im1, im2]):
-            plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-    plt.tight_layout()
-    grid_fig_path = output_dir / f"mode{mode_index+1}_{tag}_multiwl_grid.png"
-    plt.savefig(grid_fig_path, dpi=300)
+    if tag is None:
+        tag = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = output_dir / f"detection_overlap_{tag}.png"
+    fig.tight_layout()
+    fig.savefig(out_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
-    # ---------- (B) Per-wavelength individual triptychs ----------
-    per_wl_fig_paths: list[str] = []
-    if per_wavelength_figs:
-        per_wl_dir = output_dir / "per_wavelength"
-        per_wl_dir.mkdir(parents=True, exist_ok=True)
-        for li in range(L):
-            vmax = float(max(input_intensity.max(),
-                             output_intensity[li].max(),
-                             label_np.max(), 1e-8))
-            fig2, ax2 = plt.subplots(1, 3, figsize=(12, 4))
-            im0 = ax2[0].imshow(input_intensity, cmap="inferno", vmin=0, vmax=vmax)
-            ax2[0].set_title(f"Mode {mode_index+1} Input | λ={wls_nm[li]:.1f} nm")
-            ax2[0].axis("off")
-            if show_mask_overlays and overlay_on_input:
-                _overlay_detector_masks(ax2[0], evaluation_regions, detect_radius)
+    # ---- console feedback ----
+    if overlap_pixels > 0:
+        print(f"⚠ Detection regions overlap detected: "
+              f"{overlap_pixels} pixels have >1 coverage (max {max_overlap:.1f}).")
+    else:
+        print("✔ No overlap detected between evaluation regions.")
+    print(f"✔ Detection region debug plot saved -> {out_path}")
+    return out_path
 
-            im1 = ax2[1].imshow(output_intensity[li], cmap="inferno", vmin=0, vmax=vmax)
-            ax2[1].set_title(f"Model Output | λ={wls_nm[li]:.1f} nm")
-            ax2[1].axis("off")
-            if show_mask_overlays:
-                _overlay_detector_masks(ax2[1], evaluation_regions, detect_radius)
-
-            im2 = ax2[2].imshow(label_np, cmap="inferno", vmin=0, vmax=vmax)
-            ax2[2].set_title("Label")
-            ax2[2].axis("off")
-            if show_mask_overlays:
-                _overlay_detector_masks(ax2[2], evaluation_regions, detect_radius)
-
-            for ax, im in zip(ax2, [im0, im1, im2]):
-                plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-
-            plt.tight_layout()
-            p = per_wl_dir / f"mode{mode_index+1}_{tag}_l{li:02d}_{wls_nm[li]:.1f}nm.png"
-            plt.savefig(p, dpi=300)
-            plt.close(fig2)
-            per_wl_fig_paths.append(str(p))
-
-    # ---------- (C) MAT export ----------
-    mat_path = output_dir / f"mode{mode_index+1}_{tag}_multiwl.mat"
-    savemat(
-        str(mat_path),
-        {
-            "mode_index": np.array([mode_index + 1], dtype=np.int32),
-            "input_field": padded_field.detach().cpu().numpy().astype(np.complex64),  # (H,W)
-            "input_intensity": input_intensity,                                        # (H,W)
-            "model_output": output_intensity,                                          # (L,H,W)
-            "label": label_np,                                                         # (H,W)
-            "wavelengths_m": np.asarray(wavelengths, dtype=np.float64),
-            "base_wavelength_idx": np.array([base_idx], dtype=np.int32),
-            "layer_size": np.array([layer_size], dtype=np.int32),
-        },
-    )
-
-    if was_training:
-        model.train()
-
-    return {
-        "grid_fig_path": str(grid_fig_path),
-        "per_wavelength_figs": per_wl_fig_paths,
-        "mat_path": str(mat_path),
-    }
-
-def visualize_phase_masks(
-    phase_masks: list[np.ndarray],
-    out_dir: Path | str,
-    base_name: str = "phase_mask",
-    save_degree: bool = False,
-    dpi: int = 300,
-    cmap: str = "twilight",
-    show_stats: bool = True,
-) -> list[Path]:
+@torch.no_grad()
+def compute_per_plane_energy(
+    model: torch.nn.Module,
+    eigenmode_field: torch.Tensor,
+    *,
+    layer_size: int,
+) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
     """
-    为每层 phase mask 生成 PNG 可视化。
-    
-    Parameters
-    ----------
-    phase_masks : list[np.ndarray]
-        每层的相位掩模列表
-    out_dir : Path | str
-        输出目录
-    base_name : str
-        文件名前缀
-    save_degree : bool
-        是否转换为角度显示
-    dpi : int
-        图像分辨率
-    cmap : str
-        色图名称（推荐: "twilight", "hsv", "twilight_shifted"）
-    show_stats : bool
-        是否显示统计信息
-    
+    Lightweight per-plane energy tracer (no plots, no MAT).
+    Mirrors the geometry inside capture_eigenmode_propagation but only
+    records |E|^2 sum at:
+      input_plane, layer{k}_arrival, after_last_layer, output_field.
+
     Returns
     -------
-    png_paths : list[Path]
-        保存的 PNG 文件路径列表
+    plane_keys  : list[str]
+    plane_z_m   : (Nplanes,) float64
+    energy      : (Nplanes,) float64    # absolute |E|^2 sum
+    energy_norm : (Nplanes,) float64    # / energy[0]
     """
-    import matplotlib.pyplot as plt
-    
-    out_dir = Path(out_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    
-    png_paths = []
-    
-    for layer_idx, mask in enumerate(phase_masks, start=1):
-        # 转换单位
-        if save_degree:
-            mask_display = np.rad2deg(mask)
-            unit = "degrees"
-            vmin, vmax = 0, 360
+    device = next(model.parameters()).device
+    model.eval()
+
+    mode_field   = eigenmode_field.to(device=device, dtype=torch.complex64)
+    padded_field = pad_field_to_layer(mode_field, layer_size)
+    field        = padded_field.unsqueeze(0).unsqueeze(0)   # (1,1,H,W)
+
+    keys: list[str]   = []
+    zs:   list[float] = []
+    Es:   list[float] = []
+
+    def _record(key: str, f_b1hw: torch.Tensor, z_val: float) -> None:
+        keys.append(key)
+        zs.append(float(z_val))
+        Es.append(float((f_b1hw.abs() ** 2).sum().item()))
+
+    # input plane
+    z_cur = 0.0
+    _record("input_plane", field, z_cur)
+
+    # input -> layer 1
+    field = model.pre_propagation(field)
+    z_cur += float(model.pre_propagation.z)
+    _record("layer1_arrival", field, z_cur)
+
+    # diffraction layers
+    num_layers = len(model.layers)
+    for li, layer in enumerate(model.layers):
+        units  = int(layer.units)
+        pad_px = int(layer.pad_px)
+        plane  = field.squeeze(0).squeeze(0)
+        phase_c = torch.exp(
+            1j * layer.phase.to(device=device, dtype=torch.float32)
+        ).to(torch.complex64)
+
+        if pad_px > 0:
+            padded = complex_pad(plane, pad_px, pad_px)
+            mask_canvas = torch.ones(
+                units + 2 * pad_px, units + 2 * pad_px,
+                dtype=torch.complex64, device=device,
+            )
+            mask_canvas[pad_px:pad_px + units, pad_px:pad_px + units] = phase_c
+            masked = padded * mask_canvas
+            propagated = layer._propagate(masked, layer.kz_pad, float(layer.z))
+            plane_next = complex_crop(propagated, units, units, pad_px, pad_px)
         else:
-            mask_display = mask
-            unit = "radians"
-            vmin, vmax = 0, 2 * np.pi
-        
-        # 创建图形
-        fig, ax = plt.subplots(figsize=(8, 7))
-        
-        # 显示相位掩模
-        im = ax.imshow(mask_display, cmap=cmap, aspect='auto', vmin=vmin, vmax=vmax)
-        
-        # 色条
-        cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-        cbar.set_label(f'Phase ({unit})', fontsize=11)
-        
-        # 标题
-        ax.set_title(
-            f"Phase Mask - Layer {layer_idx}", 
-            fontsize=13, 
-            fontweight='bold',
-            pad=15
-        )
-        ax.set_xlabel("X (pixels)", fontsize=10)
-        ax.set_ylabel("Y (pixels)", fontsize=10)
-        
-        # 统计信息
-        if show_stats:
-            stats_text = (
-                f"Shape: {mask.shape[0]}×{mask.shape[1]}\n"
-                f"Min: {mask_display.min():.3f} {unit}\n"
-                f"Max: {mask_display.max():.3f} {unit}\n"
-                f"Mean: {mask_display.mean():.3f} {unit}\n"
-                f"Std: {mask_display.std():.3f} {unit}"
-            )
-            ax.text(
-                0.02, 0.98, stats_text,
-                transform=ax.transAxes,
-                fontsize=9,
-                verticalalignment='top',
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.85, edgecolor='gray')
-            )
-        
-        # 保存
-        png_filename = f"{base_name}_layer{layer_idx}.png"
-        png_path = out_dir / png_filename
-        fig.tight_layout()
-        fig.savefig(png_path, dpi=dpi, bbox_inches='tight')
-        plt.close(fig)
-        
-        png_paths.append(png_path)
-        print(f"✔ Saved phase mask visualization -> {png_path}")
-    
-    return png_paths
+            masked = plane * phase_c
+            plane_next = layer._propagate(masked, layer.kz_base, float(layer.z))
+
+        field = plane_next.unsqueeze(0).unsqueeze(0)
+        z_cur += float(layer.z)
+        key = f"layer{li + 2}_arrival" if li < num_layers - 1 else "after_last_layer"
+        _record(key, field, z_cur)
+
+    # last layer -> detector (out_size canvas)
+    field = _embed_field_b1hw_to_out_canvas(field, model)
+    prop = model.propagation
+    cam_units = int(prop.units)
+    pad_cam   = int(prop.pad_px)
+    plane = field.squeeze(0).squeeze(0)
+    if pad_cam > 0:
+        padded = complex_pad(plane, pad_cam, pad_cam)
+        propagated = prop._propagate(padded, prop.kz_pad, float(prop.z))
+        plane = complex_crop(propagated, cam_units, cam_units, pad_cam, pad_cam)
+    else:
+        plane = prop._propagate(plane, prop.kz_base, float(prop.z))
+    field = plane.unsqueeze(0).unsqueeze(0)
+    z_cur += float(prop.z)
+    _record("output_field", field, z_cur)
+
+    energy      = np.asarray(Es, dtype=np.float64)
+    energy_norm = energy / (energy[0] if energy[0] > 0 else 1.0)
+    return keys, np.asarray(zs, dtype=np.float64), energy, energy_norm
