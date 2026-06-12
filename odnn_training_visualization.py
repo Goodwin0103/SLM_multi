@@ -1480,235 +1480,302 @@ def capture_eigenmode_propagation_multiwl(
     base_wavelength_idx: int = 0,
     fractions_between_layers: Sequence[Sequence[float]] | None = None,
     output_fractions: Sequence[float] | None = None,
+    out_size: int | None = None,
+    padding_ratio_out: float | None = None,
 ) -> dict[str, object]:
     """
-    MultiWL version (dense snapshots supported):
-    - records: input, arrival before L1, per-layer propagation snapshots, after last layer, output plane
-    - figure: show base_wavelength_idx only (to avoid huge figure)
-    - mat: save ALL wavelengths complex fields/intensities: fields(K,L,H,W)
-    - NEW: also computes & plots remaining energy at each LAYER plane (per-λ + total),
-           and saves the values into the .mat file.
+    MultiWL propagation snapshots — matches model.forward() exactly.
+    Uses model's own modules and registered buffers for bit-exact results.
+    Supports out_size != layer_size.
     """
+    from typing import Any
+    from odnn_multiwl_model import complex_pad, complex_crop
+
     device = next(model.parameters()).device
     model.eval()
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- prepare input (H,W) -> (1,L,H,W)
+    # infer out_size from model
+    if out_size is None:
+        out_size = int(getattr(model, 'out_size', layer_size))
+
+    # prepare input
     mode_field = eigenmode_field.to(device=device, dtype=torch.complex64)
-    padded_field = pad_field_to_layer(mode_field, layer_size)  # (H,W)
+    padded_field = pad_field_to_layer(mode_field, layer_size)
     H, W = int(padded_field.shape[-2]), int(padded_field.shape[-1])
     L = int(len(wavelengths))
 
-    field = padded_field[None, None, ...].repeat(1, L, 1, 1).contiguous()  # (1,L,H,W)
+    field = padded_field[None, None, ...].repeat(1, L, 1, 1).contiguous()
 
-    # ---- defaults for snapshot fractions
+    # layer info
     layers = getattr(model, "layers", None)
     if layers is None or len(layers) == 0:
         raise ValueError("model.layers not found or empty.")
-
     num_layers = len(layers)
-    if fractions_between_layers is None:
-        default: list[tuple[float, ...]] = []
-        for li in range(num_layers):
-            if li < num_layers - 1:
-                default.append((1.0 / 3.0, 2.0 / 3.0))
-            else:
-                default.append((1.0 / 3.0, 2.0 / 3.0))
-        fractions_between_layers = tuple(default)
 
+    if fractions_between_layers is None:
+        fractions_between_layers = tuple((1.0/3.0, 2.0/3.0) for _ in range(num_layers))
     if output_fractions is None:
         output_fractions = (0.2, 0.4, 0.6, 0.8)
 
-    # ---- pad & kz (use pre_propagation pad if exists)
-    pad_px = int(getattr(getattr(model, "pre_propagation", None), "pad_px", 0))
-    Np = H + 2 * pad_px
-    kz_pad = _make_kz_stack_multiwl(Np, float(pixel_size), np.asarray(wavelengths, dtype=np.float32), device)
-
+    # records
     records: list[dict[str, Any]] = []
 
     def add_record(key: str, desc: str, E_blhw: torch.Tensor, z_value: float) -> None:
-        E_np = E_blhw[0].detach().cpu().numpy().astype(np.complex64)  # (L,H,W)
+        E_np = E_blhw[0].detach().cpu().numpy().astype(np.complex64)
         records.append({"key": key, "description": desc, "z": float(z_value), "field": E_np})
 
-    def propagate_full(E_in: torch.Tensor, z_total: float) -> torch.Tensor:
-        Epad = _complex_pad_blhw(E_in, pad_px) if pad_px > 0 else E_in
-        Epad_out = _propagate_multiwl_kz(Epad, kz_pad, float(z_total))
-        return _complex_crop_blhw(Epad_out, H, W, pad_px) if pad_px > 0 else Epad_out
+    # ===================================================================
+    # Helper: propagate using model's propagation module (bit-exact)
+    # ===================================================================
+    def propagate_exact(E_blhw: torch.Tensor, prop_module, z_dist: float) -> torch.Tensor:
+        B, Lf, Hf, Wf = E_blhw.shape
+        p = int(prop_module.pad_px)
+        if p > 0:
+            Ein = complex_pad(E_blhw, p, p)
+            kz = prop_module.kz_pad
+            Eout = prop_module._propagate(Ein, kz, z_dist)
+            return complex_crop(Eout, Hf, Wf, p, p)
+        else:
+            kz = prop_module.kz_base
+            return prop_module._propagate(E_blhw, kz, z_dist)
 
-    def propagate_with_fractions(
-        E_in: torch.Tensor,
-        *,
-        z_total: float,
-        fractions: Sequence[float],
-        stage_label: str,
-        z_base: float,
-    ) -> torch.Tensor:
-        fr = [float(f) for f in fractions]
-        fr = [f for f in fr if 0.0 < f < 1.0]
-        fr = sorted(set(fr))
+    # ===================================================================
+    # Helper: apply diffraction layer EXACTLY as model does
+    # ===================================================================
+    def apply_layer_exact(E_blhw: torch.Tensor, layer_module) -> torch.Tensor:
+        """Matches DiffractionLayerMultiWL.forward() exactly."""
+        B, Lf, Hf, Wf = E_blhw.shape
+        p = int(layer_module.pad_px)
 
-        if fr:
-            Epad = _complex_pad_blhw(E_in, pad_px) if pad_px > 0 else E_in
+        lam0 = layer_module.lam0.to(device)
+        wl_buf = layer_module.wavelengths.to(device)
+        scale = (lam0 / wl_buf)
+        phi0 = layer_module.phase.to(device, dtype=torch.float32)
+        phi = phi0[None, :, :] * scale[:, None, None]
+        phase_c = torch.exp(1j * phi).to(torch.complex64)
+
+        if p > 0:
+            Ein = complex_pad(E_blhw, p, p)
+            phase_big = torch.ones(
+                Lf, Hf + 2*p, Wf + 2*p, dtype=torch.complex64, device=device
+            )
+            phase_big[:, p:p+Hf, p:p+Wf] = phase_c
+            Ein = Ein * phase_big[None]
+            Eout = layer_module._propagate(Ein, layer_module.kz_pad, float(layer_module.z))
+            return complex_crop(Eout, Hf, Wf, p, p)
+        else:
+            Ein = E_blhw * phase_c[None]
+            return layer_module._propagate(Ein, layer_module.kz_base, float(layer_module.z))
+
+    def get_field_after_mask_only(E_blhw: torch.Tensor, layer_module) -> torch.Tensor:
+        """Field after phase mask only (no propagation) — for visualization."""
+        lam0 = layer_module.lam0.to(device)
+        wl_buf = layer_module.wavelengths.to(device)
+        scale = (lam0 / wl_buf)
+        phi0 = layer_module.phase.to(device, dtype=torch.float32)
+        phi = phi0[None, :, :] * scale[:, None, None]
+        phase_c = torch.exp(1j * phi).to(torch.complex64)
+        return E_blhw * phase_c[None]
+
+    def get_intermediate_snapshots(E_blhw, layer_module, fractions, stage_label, z_base):
+        """Record intermediate propagation snapshots (matching model's padded logic)."""
+        B, Lf, Hf, Wf = E_blhw.shape
+        p = int(layer_module.pad_px)
+        z_total = float(layer_module.z)
+
+        fr = sorted(set(f for f in fractions if 0.0 < f < 1.0))
+        if not fr:
+            return
+
+        lam0 = layer_module.lam0.to(device)
+        wl_buf = layer_module.wavelengths.to(device)
+        scale = (lam0 / wl_buf)
+        phi0 = layer_module.phase.to(device, dtype=torch.float32)
+        phi = phi0[None, :, :] * scale[:, None, None]
+        phase_c = torch.exp(1j * phi).to(torch.complex64)
+
+        if p > 0:
+            Ein = complex_pad(E_blhw, p, p)
+            phase_big = torch.ones(
+                Lf, Hf + 2*p, Wf + 2*p, dtype=torch.complex64, device=device
+            )
+            phase_big[:, p:p+Hf, p:p+Wf] = phase_c
+            Ein_masked = Ein * phase_big[None]
+            kz = layer_module.kz_pad
+
             for idx, f in enumerate(fr, start=1):
-                dist = float(z_total) * float(f)
-                Etmp = _propagate_multiwl_kz(Epad, kz_pad, dist)
-                Eshow = _complex_crop_blhw(Etmp, H, W, pad_px) if pad_px > 0 else Etmp
-                add_record(
-                    f"{stage_label}_prop{idx}",
-                    f"{stage_label} propagation ({f:.2f}·z)",
-                    Eshow,
-                    z_base + dist,
-                )
+                dist = z_total * f
+                Etmp = layer_module._propagate(Ein_masked, kz, dist)
+                Eshow = complex_crop(Etmp, Hf, Wf, p, p)
+                add_record(f"{stage_label}_prop{idx}",
+                           f"{stage_label} propagation ({f:.2f}·z)",
+                           Eshow, z_base + dist)
+        else:
+            Ein_masked = E_blhw * phase_c[None]
+            kz = layer_module.kz_base
+            for idx, f in enumerate(fr, start=1):
+                dist = z_total * f
+                Etmp = layer_module._propagate(Ein_masked, kz, dist)
+                add_record(f"{stage_label}_prop{idx}",
+                           f"{stage_label} propagation ({f:.2f}·z)",
+                           Etmp, z_base + dist)
 
-        return propagate_full(E_in, float(z_total))
+    def get_output_snapshots(E_blhw, prop_module, fractions, stage_label, z_base, Hf, Wf):
+        """Record intermediate output propagation snapshots."""
+        p = int(prop_module.pad_px)
+        z_total = float(prop_module.z)
+        fr = sorted(set(f for f in fractions if 0.0 < f < 1.0))
+        if not fr:
+            return
 
-    # ----------------------------
-    # record input
-    # ----------------------------
+        if p > 0:
+            Ein = complex_pad(E_blhw, p, p)
+            kz = prop_module.kz_pad
+            for idx, f in enumerate(fr, start=1):
+                dist = z_total * f
+                Etmp = prop_module._propagate(Ein, kz, dist)
+                Eshow = complex_crop(Etmp, Hf, Wf, p, p)
+                add_record(f"{stage_label}_prop{idx}",
+                           f"{stage_label} propagation ({f:.2f}·z)",
+                           Eshow, z_base + dist)
+        else:
+            kz = prop_module.kz_base
+            for idx, f in enumerate(fr, start=1):
+                dist = z_total * f
+                Etmp = prop_module._propagate(E_blhw, kz, dist)
+                add_record(f"{stage_label}_prop{idx}",
+                           f"{stage_label} propagation ({f:.2f}·z)",
+                           Etmp, z_base + dist)
+
+    # ===================================================================
+    # START
+    # ===================================================================
     z_cur = 0.0
     add_record("input", f"Input eigenmode {mode_index + 1} (padded)", field, z_cur)
 
-    # input -> L1
-    field = propagate_full(field, float(z_input_to_first))
+    # pre_propagation
+    field = propagate_exact(field, model.pre_propagation, float(z_input_to_first))
     z_cur += float(z_input_to_first)
     add_record("arrive_L1", "Arrival at layer 1 (before mask)", field, z_cur)
 
-    # ----------------------------
-    # layers: (mask) + (prop with snapshots)
-    # ----------------------------
+    # ===================================================================
+    # LAYERS
+    # ===================================================================
     for li, layer in enumerate(layers):
-        lam0 = layer.lam0.to(device=device)
-        wl_buf = layer.wavelengths.to(device=device)
-        scale = (lam0 / wl_buf)  # (L,)
+        # Record after mask (visualization only)
+        field_after_mask = get_field_after_mask_only(field, layer)
+        add_record(f"after_mask_L{li+1}", f"After mask L{li+1}", field_after_mask, z_cur)
 
-        phi0 = layer.phase.to(device=device, dtype=torch.float32)      # (H,W)
-        phi = phi0[None, :, :] * scale[:, None, None]                  # (L,H,W)
-        phase_c = torch.exp(1j * phi).to(torch.complex64)              # (L,H,W)
-
-        field = field * phase_c[None, ...]
-        add_record(f"after_mask_L{li+1}", f"After mask L{li+1}", field, z_cur)
-
+        # Intermediate snapshots (matching model's padded logic)
         fracs = fractions_between_layers[li] if li < len(fractions_between_layers) else ()
         stage_label = f"L{li+1}_to_L{li+2}" if li < num_layers - 1 else f"L{li+1}_internal"
+        get_intermediate_snapshots(field, layer, fracs, stage_label, z_cur)
 
-        z_base = z_cur
-        field = propagate_with_fractions(
-            field,
-            z_total=float(z_layers),
-            fractions=fracs,
-            stage_label=stage_label,
-            z_base=z_base,
-        )
-        z_cur += float(z_layers)
+        # Apply layer exactly as model does (actual state update)
+        field = apply_layer_exact(field, layer)
+        z_cur += float(layer.z)
 
-        add_record(
-            f"arrive_L{li+2}" if li < num_layers - 1 else "after_last_layer",
-            f"Arrival at layer {li+2}" if li < num_layers - 1 else "After last layer",
-            field,
-            z_cur,
-        )
+        arrival_key = f"arrive_L{li+2}" if li < num_layers - 1 else "after_last_layer"
+        arrival_desc = f"Arrival at layer {li+2}" if li < num_layers - 1 else "After last layer"
+        add_record(arrival_key, arrival_desc, field, z_cur)
 
-    # ----------------------------
-    # last -> output (with snapshots)
-    # ----------------------------
+    # ===================================================================
+    # EMBED TO OUT
+    # ===================================================================
+    if out_size != layer_size:
+        if hasattr(model, '_embed_to_out_canvas'):
+            field = model._embed_to_out_canvas(field)
+        else:
+            B_f, L_f, H_f, W_f = field.shape
+            diff_h = out_size - H_f
+            diff_w = out_size - W_f
+            if diff_h >= 0 and diff_w >= 0:
+                pt = diff_h // 2; pb = diff_h - pt
+                pl = diff_w // 2; pr = diff_w - pl
+                Er = torch.view_as_real(field)
+                Er_pad = torch.nn.functional.pad(Er, (0, 0, pl, pr, pt, pb), mode='constant', value=0)
+                field = torch.view_as_complex(Er_pad.contiguous())
+            else:
+                crop_h = (-diff_h) // 2
+                crop_w = (-diff_w) // 2
+                field = field[:, :, crop_h:crop_h+out_size, crop_w:crop_w+out_size].contiguous()
+        add_record("embed_to_out", f"Embedded to out_size={out_size}", field, z_cur)
+
+    # ===================================================================
+    # OUTPUT PROPAGATION
+    # ===================================================================
+    prop_module = model.propagation
+    H_out, W_out = field.shape[-2], field.shape[-1]
     z_base = z_cur
-    field = propagate_with_fractions(
-        field,
-        z_total=float(z_prop),
-        fractions=output_fractions,
-        stage_label="layers_to_output",
-        z_base=z_base,
-    )
-    z_cur += float(z_prop)
+
+    get_output_snapshots(field, prop_module, output_fractions, "layers_to_output", z_base, H_out, W_out)
+
+    field = propagate_exact(field, prop_module, float(prop_module.z))
+    z_cur += float(prop_module.z)
     add_record("output_plane", "Output plane (before detector)", field, z_cur)
 
-    # detector intensity (full L)
-    output_intensity = (field.abs() ** 2)[0].detach().cpu().numpy().astype(np.float32)  # (L,H,W)
+    # Detector intensity
+    output_intensity = (field.abs() ** 2)[0].detach().cpu().numpy().astype(np.float32)
 
-    # =========================================================
-    # Overview figure: rows = snapshots, cols = wavelengths
-    # (所有波长并列显示，便于比较)
-    # =========================================================
+    # ===================================================================
+    # VERIFY against model.forward()
+    # ===================================================================
+    x_verify = padded_field[None, None, ...].repeat(1, L, 1, 1).contiguous().to(device)
+    I_model = model(x_verify)
+    I_model_np = I_model[0].detach().cpu().numpy().astype(np.float32)
+    max_diff = float(np.abs(output_intensity - I_model_np).max())
+    match_status = '✔ MATCH' if max_diff < 1e-4 else '⚠ MISMATCH'
+    print(f"    [verify] max |I_slices - I_model| = {max_diff:.2e} ({match_status})")
+
+    # ===================================================================
+    # OVERVIEW FIGURE
+    # ===================================================================
     base_idx = int(np.clip(base_wavelength_idx, 0, L - 1))
-
-    # 全局 vmax（基于全部 λ 的 99.5 百分位）—— 让不同 λ 颜色尺度一致
-    intensity_all = np.stack(
-        [np.abs(r["field"]) ** 2 for r in records], axis=0
-    )  # (K, L, H, W)
-    vmax_global = float(np.percentile(intensity_all, 99.5))
-    if (not np.isfinite(vmax_global)) or vmax_global <= 0:
-        vmax_global = float(intensity_all.max() if intensity_all.size else 1.0)
-
-    # 每个 record 自己的 vmax（按行共享 vmax，跨 λ 对比同一传播位置的亮度差异）
-    vmax_per_record = np.array(
-        [float(np.percentile(intensity_all[k], 99.5)) for k in range(len(records))],
-        dtype=np.float64,
-    )
-    vmax_per_record = np.where(
-        np.isfinite(vmax_per_record) & (vmax_per_record > 0),
-        vmax_per_record,
-        vmax_global,
-    )
-
     K = len(records)
-    nrows = K
-    ncols = L
 
-    # 控制每个 panel 的物理大小，避免 L 较大时图过宽
     panel_w = 3.0
     panel_h = 3.0
-    fig, axes = plt.subplots(
-        nrows, ncols,
-        figsize=(panel_w * ncols + 1.0, panel_h * nrows),
-        squeeze=False,
-    )
+    fig, axes = plt.subplots(K, L, figsize=(panel_w * L + 1.0, panel_h * K), squeeze=False)
 
     last_im = None
     for i, rec in enumerate(records):
-        # 你可以在这里切换 vmax 策略：
-        #   row_vmax  = vmax_per_record[i]   # 行内（同一传播位置）跨 λ 比较
-        row_vmax  = vmax_global          # 全图统一刻度
-        # row_vmax = vmax_per_record[i]
+        I_rec = np.abs(rec["field"]) ** 2
+        row_vmax = float(I_rec.max()) if I_rec.size else 1.0
+        if (not np.isfinite(row_vmax)) or row_vmax <= 0:
+            row_vmax = float(I_rec.max() if I_rec.size else 1.0)
 
         for li in range(L):
             ax = axes[i, li]
-            I_li = np.abs(rec["field"][li]) ** 2
+            I_li = I_rec[li]
             im = ax.imshow(I_li, cmap="inferno", vmin=0, vmax=row_vmax)
-            wl_nm = float(wavelengths[li]) * 1e9
+            wl_nm_val = float(wavelengths[li]) * 1e9
             tag_base = " (base)" if li == base_idx else ""
-            ax.set_title(
-                f"{i+1}. {rec['description']}\nλ={wl_nm:.1f} nm{tag_base}",
-                fontsize=8,
-            )
+            ax.set_title(f"{i+1}. {rec['description']}\nλ={wl_nm_val:.1f} nm{tag_base}", fontsize=7)
             ax.axis("off")
             last_im = im
 
-        # 每行右侧加一个 colorbar（共享该行的 vmax）
-        cbar = fig.colorbar(
-            last_im, ax=axes[i, :].tolist(),
-            fraction=0.025, pad=0.01,
-        )
-        cbar.ax.tick_params(labelsize=7)
+        if last_im is not None:
+            cbar = fig.colorbar(last_im, ax=axes[i, :].tolist(), fraction=0.025, pad=0.01)
+            cbar.ax.tick_params(labelsize=7)
 
     fig.suptitle(
-        f"MultiWL propagation snapshots | mode {mode_index+1} | "
-        f"all {L} wavelengths side-by-side",
+        f"MultiWL propagation | mode {mode_index+1} | layer_size={layer_size}, out_size={out_size}",
         fontsize=12,
     )
     fig_path = output_dir / f"propagation_multiwl_mode{mode_index+1}_{tag}.png"
     fig.savefig(fig_path, dpi=300, bbox_inches="tight")
     plt.close(fig)
 
-
-    # =========================================================
-    # NEW: energy at each LAYER plane
-    # Only pick layer planes: input / arrive_Lk / after_last_layer / output_plane
-    # =========================================================
-    wanted_keys = ["input"] \
-                + [f"arrive_L{k+1}" for k in range(num_layers)] \
-                + ["after_last_layer", "output_plane"]
+    # ===================================================================
+    # ENERGY PLOT
+    # ===================================================================
+    wanted_keys = ["input"] + [f"arrive_L{k+1}" for k in range(num_layers)] + ["after_last_layer"]
+    if out_size != layer_size:
+        wanted_keys.append("embed_to_out")
+    wanted_keys.append("output_plane")
 
     plane_records: list[dict[str, Any]] = []
     for k in wanted_keys:
@@ -1717,14 +1784,11 @@ def capture_eigenmode_propagation_multiwl(
                 plane_records.append(r)
                 break
 
-    # per-λ + total energy
     energy_planes_per_wl = np.stack(
-        [(np.abs(r["field"]) ** 2).reshape(L, -1).sum(axis=1) for r in plane_records],
-        axis=0,
-    ).astype(np.float64)                                          # (Nplanes, L)
-    energy_planes_total = energy_planes_per_wl.sum(axis=1)         # (Nplanes,)
+        [(np.abs(r["field"]) ** 2).reshape(L, -1).sum(axis=1) for r in plane_records], axis=0,
+    ).astype(np.float64)
+    energy_planes_total = energy_planes_per_wl.sum(axis=1)
 
-    # normalize to input
     E0_wl = energy_planes_per_wl[0].copy()
     E0_total = float(energy_planes_total[0])
     E0_wl_safe = np.where(E0_wl > 0, E0_wl, 1.0)
@@ -1735,22 +1799,15 @@ def capture_eigenmode_propagation_multiwl(
     plane_z_m = np.array([r["z"] for r in plane_records], dtype=np.float64)
     wls_nm = (np.asarray(wavelengths, dtype=np.float64) * 1e9)
 
-    # plot
     fig_e, ax_e = plt.subplots(figsize=(max(7.0, 0.9 * len(plane_keys)), 4.5))
     xs = np.arange(len(plane_keys))
     for li in range(L):
-        ax_e.plot(
-            xs, energy_planes_per_wl_norm[:, li],
-            marker="o", label=f"λ={wls_nm[li]:.1f} nm",
-        )
-    ax_e.plot(
-        xs, energy_planes_total_norm,
-        marker="s", linestyle="--", color="k", label="total (sum λ)",
-    )
+        ax_e.plot(xs, energy_planes_per_wl_norm[:, li], marker="o", label=f"λ={wls_nm[li]:.1f} nm")
+    ax_e.plot(xs, energy_planes_total_norm, marker="s", linestyle="--", color="k", label="total")
     ax_e.set_xticks(xs)
     ax_e.set_xticklabels(plane_keys, rotation=30, ha="right", fontsize=8)
     ax_e.set_ylabel("Energy (normalized to input)")
-    ax_e.set_title(f"Energy at each layer plane | mode {mode_index+1}")
+    ax_e.set_title(f"Energy at each plane | mode {mode_index+1}")
     ax_e.grid(True, alpha=0.3)
     ax_e.set_ylim(bottom=0.0)
     ax_e.legend(fontsize=9, loc="best")
@@ -1759,66 +1816,46 @@ def capture_eigenmode_propagation_multiwl(
     fig_e.savefig(energy_fig_path, dpi=250, bbox_inches="tight")
     plt.close(fig_e)
 
-    # console table
-    print(f"\n[Energy at each plane | mode {mode_index+1} | tag={tag}]")
-    header = f"  {'plane':<20s} {'z(mm)':>8s} " \
-             + " ".join([f"E_{wls_nm[li]:.1f}nm(%)".rjust(14) for li in range(L)]) \
-             + f" {'E_total(%)':>12s}"
-    print(header)
-    for i, k in enumerate(plane_keys):
-        row = f"  {k:<20s} {plane_z_m[i]*1e3:>8.2f} "
-        row += " ".join([f"{energy_planes_per_wl_norm[i, li]*100:>13.2f}" for li in range(L)])
-        row += f" {energy_planes_total_norm[i]*100:>11.2f}"
-        print(row)
-
-    # =========================================================
-    # MAT export (store all L) + new energy fields
-    # =========================================================
+    # ===================================================================
+    # MAT EXPORT
+    # ===================================================================
     slice_names = np.array([r["key"] for r in records], dtype=object)
     slice_desc = np.array([r["description"] for r in records], dtype=object)
     z_positions = np.array([r["z"] for r in records], dtype=np.float64)
-    field_stack = np.stack([r["field"] for r in records], axis=0).astype(np.complex64)  # (K,L,H,W)
-    intensity_stack_all = (np.abs(field_stack) ** 2).astype(np.float32)                  # (K,L,H,W)
-    energy_trace = intensity_stack_all.reshape(intensity_stack_all.shape[0], -1).sum(axis=1).astype(np.float64)
 
     mat_path = output_dir / f"propagation_multiwl_mode{mode_index+1}_{tag}.mat"
-    savemat(
-        str(mat_path),
-        {
-            "fields": field_stack,
-            "intensities": intensity_stack_all,
-            "energies": energy_trace,
-            "slice_names": slice_names,
-            "slice_descriptions": slice_desc,
-            "z_positions_m": z_positions,
-            "output_intensity": output_intensity,
-            "mode_index": np.array([mode_index + 1], dtype=np.int32),
-            "layer_size": np.array([layer_size], dtype=np.int32),
-            "pixel_size": np.array([pixel_size], dtype=np.float64),
-            "wavelengths_m": np.asarray(wavelengths, dtype=np.float64),
-            "z_input_to_first": np.array([z_input_to_first], dtype=np.float64),
-            "z_layers": np.array([z_layers], dtype=np.float64),
-            "z_prop": np.array([z_prop], dtype=np.float64),
-            "base_wavelength_idx": np.array([base_idx], dtype=np.int32),
-
-            # ---- new: per-layer energy bookkeeping ----
-            "plane_keys":                np.array(plane_keys, dtype=object),
-            "plane_z_m":                 plane_z_m,
-            "energy_planes_per_wl":      energy_planes_per_wl,         # (Nplanes, L)
-            "energy_planes_total":       energy_planes_total,          # (Nplanes,)
-            "energy_planes_per_wl_norm": energy_planes_per_wl_norm,    # (Nplanes, L)
-            "energy_planes_total_norm":  energy_planes_total_norm,     # (Nplanes,)
-        },
-    )
+    savemat(str(mat_path), {
+        "output_intensity": output_intensity,
+        "slice_names": slice_names,
+        "slice_descriptions": slice_desc,
+        "z_positions_m": z_positions,
+        "mode_index": np.array([mode_index + 1], dtype=np.int32),
+        "layer_size": np.array([layer_size], dtype=np.int32),
+        "out_size": np.array([out_size], dtype=np.int32),
+        "pixel_size": np.array([pixel_size], dtype=np.float64),
+        "wavelengths_m": np.asarray(wavelengths, dtype=np.float64),
+        "z_input_to_first": np.array([z_input_to_first], dtype=np.float64),
+        "z_layers": np.array([z_layers], dtype=np.float64),
+        "z_prop": np.array([z_prop], dtype=np.float64),
+        "base_wavelength_idx": np.array([base_wavelength_idx], dtype=np.int32),
+        "plane_keys": np.array(plane_keys, dtype=object),
+        "plane_z_m": plane_z_m,
+        "energy_planes_per_wl": energy_planes_per_wl,
+        "energy_planes_total": energy_planes_total,
+        "energy_planes_per_wl_norm": energy_planes_per_wl_norm,
+        "energy_planes_total_norm": energy_planes_total_norm,
+        "max_diff_vs_model": np.array([max_diff], dtype=np.float64),
+    })
 
     return {
-        "fig_path":        str(fig_path),
-        "mat_path":        str(mat_path),
+        "fig_path": str(fig_path),
+        "mat_path": str(mat_path),
         "energy_fig_path": str(energy_fig_path),
-        "plane_keys":      plane_keys,
-        "plane_z_m":       plane_z_m,
+        "plane_keys": plane_keys,
+        "plane_z_m": plane_z_m,
         "energy_planes_per_wl_norm": energy_planes_per_wl_norm,
-        "energy_planes_total_norm":  energy_planes_total_norm,
+        "energy_planes_total_norm": energy_planes_total_norm,
+        "max_diff_vs_model": max_diff,
     }
 
 @torch.no_grad()

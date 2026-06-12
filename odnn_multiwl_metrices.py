@@ -86,10 +86,10 @@ def evaluate_multiwl_comprehensive_metrics(
     M = int(num_modes)
     eps = 1e-12
 
-    # 实际积分半径（与 evaluate_spot_metrics 保持一致用 detect_radius/2）
-    r_eff = max(1, int(round(detect_radius / 2.0)))
+    
+    r_eff = max(1, int(detect_radius))
 
-    # ── 构建每个 ROI 的圆形 mask（numpy, 预计算） ──
+    # ── 构建每个 ROI 的圆形 mask（numpy, 预计算）──
     def _build_circle_mask(x0, x1, y0, y1, radius):
         hh = y1 - y0
         ww = x1 - x0
@@ -103,8 +103,11 @@ def evaluate_multiwl_comprehensive_metrics(
         x0, x1, y0, y1 = reg
         roi_masks.append(_build_circle_mask(x0, x1, y0, y1, r_eff))
 
-    # ── 能量矩阵 E[input_mode, output_wl, roi_mode] ──
-    energy_matrix = np.zeros((M, L, M), dtype=np.float64)
+    # E_full[m_in, l_out, l_roi, m_roi] =
+    #   "输入 mode m_in，模型在波长通道 l_out 的输出图，
+    #    落在 ROI[m_roi * L + l_roi] 上的能量"
+    # 这是关键的 4D 张量，能正确测量波长串扰
+    energy_matrix_full = np.zeros((M, L, L, M), dtype=np.float64)
     total_energy_output = np.zeros((M, L), dtype=np.float64)
     input_energy = np.zeros(M, dtype=np.float64)
 
@@ -112,36 +115,42 @@ def evaluate_multiwl_comprehensive_metrics(
         # 准备输入: eigenmode m → pad → (1, L, H, W)
         mode_field = mmf_modes[m_idx].to(device=device, dtype=torch.complex64)
         padded = pad_field_to_layer(mode_field, layer_size)
-        input_energy[m_idx] = float((padded.abs() ** 2).sum().item())
 
         x = padded[None, None, ...].repeat(1, L, 1, 1).contiguous()  # (1, L, H, W)
 
+        # 用模型实际接收的单波长能量作为输入能量（IL 分母清晰）
+        input_energy[m_idx] = float((x[0, 0].abs() ** 2).sum().item())
+
         # 前向传播
-        I_blhw = model(x)  # (1, L, H, W) float intensity
-        I_lhw = I_blhw[0].detach().cpu().numpy().astype(np.float64)  # (L, H, W)
+        I_blhw = model(x)  # (1, L, out_size, out_size)
+        I_lhw = I_blhw[0].detach().cpu().numpy().astype(np.float64)  # (L, H_out, W_out)
 
-        for l_idx in range(L):
-            I_hw = I_lhw[l_idx]
-            total_energy_output[m_idx, l_idx] = float(I_hw.sum())
+        for l_out in range(L):  # 模型输出的波长通道
+            I_hw = I_lhw[l_out]
+            total_energy_output[m_idx, l_out] = float(I_hw.sum())
 
-            # 计算该模式输入、该波长输出面上每个模式 ROI 的能量
-            for j in range(M):
-                roi_idx = j * L + l_idx
-                x0, x1, y0, y1 = evaluation_regions[roi_idx]
-                patch = I_hw[y0:y1, x0:x1]
-                mask = roi_masks[roi_idx]
-                # 确保 mask 和 patch 形状一致
-                h_p, w_p = patch.shape
-                h_m, w_m = mask.shape
-                h_use = min(h_p, h_m)
-                w_use = min(w_p, w_m)
-                energy_matrix[m_idx, l_idx, j] = float(
-                    patch[:h_use, :w_use][mask[:h_use, :w_use]].sum()
-                )
+            # ★ 在波长通道 l_out 的输出图上，对所有 (l_roi, m_roi) 组合求 ROI 能量
+            for l_roi in range(L):
+                for j in range(M):
+                    roi_idx = j * L + l_roi  # ROI[j, l_roi]
+                    x0, x1, y0, y1 = evaluation_regions[roi_idx]
+                    patch = I_hw[y0:y1, x0:x1]
+                    mask = roi_masks[roi_idx]
+                    h_p, w_p = patch.shape
+                    h_m, w_m = mask.shape
+                    h_use = min(h_p, h_m)
+                    w_use = min(w_p, w_m)
+                    energy_matrix_full[m_idx, l_out, l_roi, j] = float(
+                        patch[:h_use, :w_use][mask[:h_use, :w_use]].sum()
+                    )
+
+    energy_matrix = np.zeros((M, L, M), dtype=np.float64)
+    for m in range(M):
+        for l in range(L):
+            energy_matrix[m, l, :] = energy_matrix_full[m, l, l, :]
 
     # ================================================================
-    # 1. Mode Isolation (模式隔离)
-    #    对于输入模式 m，在波长 l 的输出面上：
+    # 1. Mode Isolation (同波长内的模式隔离) — 公式不变（已正确）
     #    iso = E[m,l,m] / Σ_{j≠m} E[m,l,j]
     # ================================================================
     mode_isolation_db = np.zeros((M, L), dtype=np.float64)
@@ -153,27 +162,34 @@ def evaluate_multiwl_comprehensive_metrics(
             mode_isolation_db[m, l] = 10.0 * np.log10(max(ratio, eps))
 
     mode_isolation_db_mean = float(np.mean(mode_isolation_db))
-    mode_isolation_db_per_wl = np.mean(mode_isolation_db, axis=0)  # (L,)
+    mode_isolation_db_per_wl = np.mean(mode_isolation_db, axis=0)
 
     # ================================================================
-    # 2. Wavelength Isolation (波长隔离)
-    #    对于输入模式 m，在目标波长 l：
-    #    iso = E[m,l,m] / Σ_{l'≠l} E[m,l',m]
-    #    即：该模式能量在目标波长 vs 其他波长的同一模式 ROI
+    # 2. Wavelength Isolation (波长隔离) ─── 
+    #    对输入模式 m，在输出波长通道 l_out 上：
+    #    signal = E_full[m, l_out, l_out, m]   # 落在"匹配 λ 的正确 mode ROI"
+    #    noise  = Σ_{l_roi≠l_out, m_roi} E_full[m, l_out, l_roi, m_roi]
+    #            # 落在"其他 λ 的 ROI"（任何 mode）
+    #    iso = signal / noise
+    #    物理含义：波长通道 l_out 中，能量是否正确落到 λ=l_out 的 ROI 集合
     # ================================================================
     wavelength_isolation_db = np.zeros((M, L), dtype=np.float64)
     for m in range(M):
-        for l in range(L):
-            signal = energy_matrix[m, l, m]
-            noise = sum(energy_matrix[m, lp, m] for lp in range(L) if lp != l)
+        for l_out in range(L):
+            signal = energy_matrix_full[m, l_out, l_out, m]
+            # 跑到其他波长 ROI 的能量（任何 mode）
+            noise = 0.0
+            for l_roi in range(L):
+                if l_roi == l_out:
+                    continue
+                for m_roi in range(M):
+                    noise += energy_matrix_full[m, l_out, l_roi, m_roi]
             if L == 1:
-                # 单波长时无意义，设为 inf
-                wavelength_isolation_db[m, l] = float('inf')
+                wavelength_isolation_db[m, l_out] = float('inf')
             else:
                 ratio = signal / max(noise, eps)
-                wavelength_isolation_db[m, l] = 10.0 * np.log10(max(ratio, eps))
+                wavelength_isolation_db[m, l_out] = 10.0 * np.log10(max(ratio, eps))
 
-    # 对 inf 做特殊处理
     finite_mask = np.isfinite(wavelength_isolation_db)
     wavelength_isolation_db_mean = (
         float(np.mean(wavelength_isolation_db[finite_mask]))
@@ -186,20 +202,20 @@ def evaluate_multiwl_comprehensive_metrics(
     ], dtype=np.float64)
 
     # ================================================================
-    # 3. Target / All ROI
-    #    对于输入模式 m：
-    #    target_energy = Σ_l E[m,l,m] (所有波长上目标 ROI 的总能量)
-    #    all_roi_energy = Σ_{j,l} E[m,l,j] (所有 ROI 的总能量)
-    #    ratio = target / all
+    # 3. Target / All ROI ───
+    #    对输入模式 m：
+    #    target = Σ_l E_full[m, l, l, m]  (所有 λ 上正确 mode 在匹配 λ-ROI 的能量)
+    #    all    = Σ_{l_out, l_roi, m_roi} E_full[m, l_out, l_roi, m_roi]
+    #             (所有 λ 通道上、所有 ROI 的总能量，包括 wl mismatch + mode mismatch)
+    #    ratio  = target / all
     # ================================================================
     target_all_roi_ratio = np.zeros(M, dtype=np.float64)
     for m in range(M):
-        target_sum = sum(energy_matrix[m, l, m] for l in range(L))
-        all_roi_sum = float(energy_matrix[m, :, :].sum())
+        target_sum = sum(energy_matrix_full[m, l, l, m] for l in range(L))
+        all_roi_sum = float(energy_matrix_full[m, :, :, :].sum())
         target_all_roi_ratio[m] = target_sum / max(all_roi_sum, eps)
 
     target_all_roi_ratio_mean = float(np.mean(target_all_roi_ratio))
-    # 转 dB: 10*log10(target / (all - target))
     target_all_roi_db = np.zeros(M, dtype=np.float64)
     for m in range(M):
         r = target_all_roi_ratio[m]
@@ -209,8 +225,7 @@ def evaluate_multiwl_comprehensive_metrics(
     # ================================================================
     # 4. Crosstalk 矩阵
     # ================================================================
-    # (a) 模式串扰矩阵 (per wavelength): (L, M, M)
-    #     crosstalk[l, m_in, m_roi] = E[m_in, l, m_roi] / Σ_j E[m_in, l, j]
+    # (a) 模式串扰矩阵 (per wavelength): (L, M, M) — 公式不变（已正确）
     crosstalk_matrix_per_wl = np.zeros((L, M, M), dtype=np.float64)
     for l in range(L):
         for m in range(M):
@@ -218,32 +233,32 @@ def evaluate_multiwl_comprehensive_metrics(
             if row_sum > eps:
                 crosstalk_matrix_per_wl[l, m, :] = energy_matrix[m, l, :] / row_sum
 
-    # (b) 波长串扰矩阵 (per mode): (M, L, L)
-    #     crosstalk_wl[m, l_target, l_source] = E[m, l_source, m] / Σ_{l'} E[m, l', m]
+    # (b) ★ 修复 3：波长串扰矩阵 (per mode): (M, L_source, L_target)
+    #     crosstalk_wl[m, s, t] =
+    #       (波长通道 s 的输出图，落在 mode m 的 ROI@λ_t 的能量)
+    #       / (波长通道 s 的输出图，落在 mode m 的所有 λ-ROI 的能量)
+    #     物理含义：与 prediction viz 底部 R[s,t] 完全一致
     crosstalk_matrix_wl = np.zeros((M, L, L), dtype=np.float64)
     for m in range(M):
-        wl_energies = np.array([energy_matrix[m, l, m] for l in range(L)], dtype=np.float64)
-        total_wl = wl_energies.sum()
-        if total_wl > eps:
-            crosstalk_matrix_wl[m, :, :] = np.outer(
-                np.ones(L), wl_energies / total_wl
-            )
-            # 实际上每行相同 → 改为对角占比
-            for l in range(L):
-                crosstalk_matrix_wl[m, l, :] = wl_energies / total_wl
+        for s in range(L):  # 源/输出波长通道
+            row_energies = np.array([
+                energy_matrix_full[m, s, t, m] for t in range(L)
+            ], dtype=np.float64)
+            row_sum = row_energies.sum()
+            if row_sum > eps:
+                crosstalk_matrix_wl[m, s, :] = row_energies / row_sum
 
     # ================================================================
-    # 5. Insertion Loss
+    # 5. Insertion Loss — 公式不变（已正确）
     #    IL = -10*log10( E_out_total / (E_in * L) )
-    #    因为输入被复制到 L 个波长通道，总输入能量 = E_in * L
     # ================================================================
-    output_total_per_mode = total_energy_output.sum(axis=1)  # (M,)
+    output_total_per_mode = total_energy_output.sum(axis=1)
     il_ratio = output_total_per_mode / np.clip(input_energy * L, eps, None)
     insertion_loss_db = -10.0 * np.log10(np.clip(il_ratio, eps, None))
     insertion_loss_db_mean = float(np.mean(insertion_loss_db))
 
     # ================================================================
-    # 6. SNR (per mode, per wavelength)
+    # 6. SNR — 公式不变（已正确）
     #    SNR = E_target_roi / (E_total_plane - E_target_roi)
     # ================================================================
     snr_db = np.zeros((M, L), dtype=np.float64)
@@ -331,6 +346,7 @@ def evaluate_multiwl_comprehensive_metrics(
         "throughput_per_mode": throughput_per_mode,
         # Raw
         "energy_matrix": energy_matrix,
+        "energy_matrix_full": energy_matrix_full,
         "total_energy_output": total_energy_output,
         "input_energy": input_energy,
         "wavelengths_m": np.asarray(wavelengths_m, dtype=np.float64),
@@ -533,6 +549,7 @@ def plot_and_save_multiwl_metrics(
         "throughput_per_mode": metrics["throughput_per_mode"],
         # Raw energy
         "energy_matrix": metrics["energy_matrix"],
+        "energy_matrix_full": metrics["energy_matrix_full"],
         "total_energy_output": metrics["total_energy_output"],
         "input_energy": metrics["input_energy"],
     })

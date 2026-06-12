@@ -44,11 +44,11 @@ class PropagationMultiWL(nn.Module):
         wl = torch.tensor(wavelengths, dtype=torch.float32, device=device)  # (L,)
         self.register_buffer("wavelengths", wl)
 
-        self.register_buffer("kz_base", self._make_kz_stack(self.units, self.dx, wl, device))  # (L,N,N)
+        self.register_buffer("kz_base", self._make_kz_stack(self.units, self.dx, wl, device))
 
         if self.pad_px > 0:
             units_pad = self.units + 2 * self.pad_px
-            self.register_buffer("kz_pad", self._make_kz_stack(units_pad, self.dx, wl, device))  # (L,Np,Np)
+            self.register_buffer("kz_pad", self._make_kz_stack(units_pad, self.dx, wl, device))
         else:
             self.kz_pad = None
 
@@ -87,9 +87,9 @@ class PropagationMultiWL(nn.Module):
 
         if self.pad_px > 0:
             p = self.pad_px
-            Ein = complex_pad(inputs, p, p)                  # (B,L,H+2p,W+2p)
-            Eout = self._propagate(Ein, self.kz_pad, self.z) # (B,L,H+2p,W+2p)
-            return complex_crop(Eout, H, W, p, p)            # (B,L,H,W)
+            Ein = complex_pad(inputs, p, p)
+            Eout = self._propagate(Ein, self.kz_pad, self.z)
+            return complex_crop(Eout, H, W, p, p)
         else:
             return self._propagate(inputs, self.kz_base, self.z)
 
@@ -139,25 +139,24 @@ class DiffractionLayerMultiWL(nn.Module):
         B, L, H, W = inputs.shape
 
         # build wavelength-scaled phase: phi_l = phi0 * (lam0/lam_l)
-        scale = (self.lam0 / self.wavelengths).to(inputs.device)          # (L,)
-        phi = self.phase[None, :, :] * scale[:, None, None]               # (L,H,W)
-        phase_c = torch.exp(1j * phi).to(torch.complex64)                 # (L,H,W)
+        scale = (self.lam0 / self.wavelengths).to(inputs.device)
+        phi = self.phase[None, :, :] * scale[:, None, None]
+        phase_c = torch.exp(1j * phi).to(torch.complex64)
 
         if self.pad_px > 0:
             p = self.pad_px
-            Ein = complex_pad(inputs, p, p)                                # (B,L,H+2p,W+2p)
+            Ein = complex_pad(inputs, p, p)
 
-            # phase outside is 1 (no phase)
             phase_big = torch.ones(
                 L, H + 2 * p, W + 2 * p, dtype=torch.complex64, device=inputs.device
             )
             phase_big[:, p : p + H, p : p + W] = phase_c
-            Ein = Ein * phase_big[None]                                    # (B,L,H+2p,W+2p)
+            Ein = Ein * phase_big[None]
 
             Eout = self._propagate(Ein, self.kz_pad, self.z)
-            return complex_crop(Eout, H, W, p, p)                           # (B,L,H,W)
+            return complex_crop(Eout, H, W, p, p)
         else:
-            Ein = inputs * phase_c[None]                                    # (B,L,H,W)
+            Ein = inputs * phase_c[None]
             return self._propagate(Ein, self.kz_base, self.z)
 
 
@@ -178,12 +177,12 @@ class RegressionDetector(nn.Module):
 
 
 # -------------------------
-# D2NN Multi-wavelength model
+# D2NN Multi-wavelength model (★ 支持 out_size)
 # -------------------------
 class D2NNModelMultiWL(nn.Module):
     """
-    inputs:  (B, L, H, W) complex
-    outputs: (B, L, H, W) intensity
+    inputs:  (B, L, layer_size, layer_size) complex
+    outputs: (B, L, out_size, out_size) intensity
     """
     def __init__(
         self,
@@ -197,9 +196,19 @@ class D2NNModelMultiWL(nn.Module):
         padding_ratio=0.5,
         z_input_to_first=0.0,
         base_wavelength_idx=None,
+        out_size=None,              # ★ 新增
+        padding_ratio_out=None,     # ★ 新增
     ):
         super().__init__()
+        self.layer_size = int(layer_size)
+        self.out_size = int(out_size) if out_size is not None else int(layer_size)
+
         pad_px = int(round(layer_size * padding_ratio))
+
+        if padding_ratio_out is None:
+            padding_ratio_out = padding_ratio
+        self.padding_ratio_out = float(padding_ratio_out)
+        pad_px_out = int(round(self.out_size * self.padding_ratio_out))
 
         self.pre_propagation = PropagationMultiWL(
             layer_size, pixel_size, wavelengths, z_input_to_first, device, pad_px=pad_px
@@ -220,16 +229,47 @@ class D2NNModelMultiWL(nn.Module):
             ]
         )
 
+        # ★ 最后传播层使用 out_size
         self.propagation = PropagationMultiWL(
-            layer_size, pixel_size, wavelengths, z_prop, device, pad_px=pad_px
+            self.out_size, pixel_size, wavelengths, z_prop, device, pad_px=pad_px_out
         )
 
         self.regression = RegressionDetector()
+
+    def _embed_to_out_canvas(self, x):
+        """
+        将 (B, L, layer_size, layer_size) 嵌入到 (B, L, out_size, out_size)
+        out_size > layer_size: zero-pad
+        out_size < layer_size: center-crop
+        out_size == layer_size: 直接返回
+        """
+        if self.out_size == self.layer_size:
+            return x
+
+        B, L, H, W = x.shape
+        diff_h = self.out_size - H
+        diff_w = self.out_size - W
+
+        if diff_h >= 0 and diff_w >= 0:
+            # zero-pad
+            pt = diff_h // 2
+            pb = diff_h - pt
+            pl = diff_w // 2
+            pr = diff_w - pl
+            Er = torch.view_as_real(x)  # (B, L, H, W, 2)
+            Er_pad = F.pad(Er, (0, 0, pl, pr, pt, pb), mode='constant', value=0)
+            return torch.view_as_complex(Er_pad.contiguous())
+        else:
+            # center-crop
+            crop_h = (-diff_h) // 2
+            crop_w = (-diff_w) // 2
+            return x[:, :, crop_h:crop_h + self.out_size, crop_w:crop_w + self.out_size].contiguous()
 
     def forward(self, x):
         x = self.pre_propagation(x)
         for layer in self.layers:
             x = layer(x)
+        x = self._embed_to_out_canvas(x)   # ★ 嵌入到 out_size 画布
         x = self.propagation(x)
-        x = self.regression(x)  # (B,L,H,W)
+        x = self.regression(x)             # (B, L, out_size, out_size)
         return x

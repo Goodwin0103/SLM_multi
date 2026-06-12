@@ -26,7 +26,6 @@ from odnn_generate_label import (
     compute_label_centers,
 )
 from odnn_io import load_complex_modes_from_mat
-from odnn_processing import prepare_sample
 from odnn_training_eval import spot_energy_and_snr
 # MultiWL model
 from odnn_multiwl_model import D2NNModelMultiWL
@@ -56,6 +55,7 @@ from odnn_multiwl_metrices import (
     evaluate_multiwl_comprehensive_metrics,
     plot_and_save_multiwl_metrics,
 )
+from odnn_processing import prepare_sample, pad_field_to_layer  # ★ 添加 pad_field_to_layer
 
 # ============================================================
 # Reproducibility / device
@@ -104,11 +104,27 @@ z_layers = 45e-3
 pixel_size = 12.5e-6
 z_prop = 20e-2
 z_input_to_first = 0
+out_size = 600
+padding_ratio_out = 0.5
 
-# wavelengths (MultiWL)
-wavelengths = np.array([1535e-9, 1535.5e-9], dtype=np.float32)
-base_wavelength_idx = 0
+# ============================================================
+# Wavelengths (MultiWL) — 起始波长 + 间隔 + 数量
+# ============================================================
+wl_start_nm = 1550       # 起始波长 (nm)
+wl_spacing_nm = 0.5         # 波长间隔 (nm)
+wl_count = 2                # 波长数量
+base_wavelength_idx = 0     # 基准波长索引
+
+wavelengths = (wl_start_nm + np.arange(wl_count) * wl_spacing_nm).astype(np.float32) * 1e-9
 L = int(len(wavelengths))
+
+if base_wavelength_idx >= L:
+    base_wavelength_idx = 0
+
+print(f"★ Wavelengths ({L}): {wavelengths*1e9} nm | start={wl_start_nm} nm | "
+      f"spacing={wl_spacing_nm} nm | base_idx={base_wavelength_idx}")
+
+print(f"★ Wavelengths: {wavelengths*1e9} nm, spacing={wl_spacing_nm} nm, count={L}")
 
 # data options
 phase_option = 4
@@ -120,9 +136,19 @@ epochs = 1000
 lr = 1.99
 padding_ratio = 0.5
 
-# output root
+# ============================================================
+# Output root — 清晰命名
+# ============================================================
 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-RUN_ROOT = Path(f"results/{num_modes}modes/{len(wavelengths)}wl_{wavelengths[base_wavelength_idx]}(0.5)_base_{base_wavelength_idx}_ls_{layer_size}_zp_{z_prop}z_{z_layers}_pr{padding_ratio}_c{circle_focus_radius}_{timestamp}")
+RUN_ROOT = Path(
+    f"results/"
+    f"{num_modes}modes/"
+    f"{L}wl_{wl_start_nm:.1f}nm_sp{wl_spacing_nm:.1f}nm_"
+    f"base{base_wavelength_idx}_"
+    f"ls{layer_size}_out_{out_size}_zp{z_prop*1e3:.0f}mm_z{z_layers*1e3:.1f}mm_"
+    f"pr{padding_ratio}_c{circle_focus_radius}_"
+    f"{timestamp}"
+)
 RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 # prediction viz samples
@@ -506,8 +532,8 @@ print(f"Generating MultiWL Labels: {num_modes} modes × {L} wavelengths = {num_m
 print(f"{'=' * 60}")
 
 mmf_label_patterns, evaluation_regions = generate_detector_patterns_multiwl(
-    H=layer_size,
-    W=layer_size,
+    H=out_size,
+    W=out_size,
     num_modes=num_modes,
     num_wavelengths=L,
     radius=circle_focus_radius,
@@ -523,14 +549,14 @@ print(f"✔ Generated {len(evaluation_regions)} evaluation regions")
 if show_detection_overlap_debug:
     detection_debug_dir = RUN_ROOT / "detection_region_debug"
     detection_debug_dir.mkdir(parents=True, exist_ok=True)
-    overlap_map = np.zeros((layer_size, layer_size), dtype=np.float32)
+    overlap_map = np.zeros((out_size, out_size), dtype=np.float32)
     for (x0, x1, y0, y1) in evaluation_regions:
         overlap_map[y0:y1, x0:x1] += 1.0
     overlap_pixels = int(np.count_nonzero(overlap_map > 1.0 + 1e-6))
     max_overlap = float(overlap_map.max()) if overlap_map.size else 0.0
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    axes[0].imshow(np.zeros((layer_size, layer_size), dtype=np.float32), cmap="Greys")
+    axes[0].imshow(np.zeros((out_size, out_size), dtype=np.float32), cmap="Greys")
     axes[0].set_title("MultiWL Detector Layout")
     axes[0].set_axis_off()
 
@@ -588,11 +614,13 @@ def build_eigenmode_dataset_multiwl() -> tuple[list[TensorDataset], dict]:
         complex_weights_ts, MMF_data_ts, num_samples, num_modes, field_size
     ).to(torch.complex64)
 
-    dummy_label = torch.zeros([1, layer_size, layer_size], dtype=torch.float32)
+    # ★ 修复：只 pad 输入场到 layer_size，不涉及 label
     images_prepared = []
     for i in range(num_samples):
-        img_i, _ = prepare_sample(image_data[i], dummy_label, layer_size)
-        images_prepared.append(img_i)
+        img_padded = pad_field_to_layer(image_data[i], layer_size)
+        if img_padded.ndim == 2:
+            img_padded = img_padded.unsqueeze(0)
+        images_prepared.append(img_padded.to(torch.complex64))
     image_tensor = torch.stack(images_prepared, dim=0)
 
     for wl_idx in range(L):
@@ -611,7 +639,6 @@ def build_eigenmode_dataset_multiwl() -> tuple[list[TensorDataset], dict]:
     meta = {"amplitudes": amplitudes, "phases": phases}
     return datasets_per_wl, meta
 
-
 def build_superposition_dataset_multiwl(num_samples: int, rng_seed: int) -> tuple[list[TensorDataset], dict]:
     rng = np.random.RandomState(rng_seed)
     amplitudes = rng.uniform(0.0, 1.0, size=(num_samples, num_modes)).astype(np.float32)
@@ -628,11 +655,13 @@ def build_superposition_dataset_multiwl(num_samples: int, rng_seed: int) -> tupl
         complex_weights_ts, MMF_data_ts, num_samples, num_modes, field_size
     ).to(torch.complex64)
 
-    dummy_label = torch.zeros([1, layer_size, layer_size], dtype=torch.float32)
+    # ★ 修复：只 pad 输入场到 layer_size，不涉及 label
     images_prepared = []
     for i in range(num_samples):
-        img_i, _ = prepare_sample(image_data[i], dummy_label, layer_size)
-        images_prepared.append(img_i)
+        img_padded = pad_field_to_layer(image_data[i], layer_size)
+        if img_padded.ndim == 2:
+            img_padded = img_padded.unsqueeze(0)
+        images_prepared.append(img_padded.to(torch.complex64))
     image_tensor = torch.stack(images_prepared, dim=0)
 
     datasets_per_wl = []
@@ -651,7 +680,6 @@ def build_superposition_dataset_multiwl(num_samples: int, rng_seed: int) -> tupl
 
     meta = {"amplitudes": amplitudes, "phases": phases}
     return datasets_per_wl, meta
-
 
 # ============================================================
 # Train/Eval loop
@@ -697,6 +725,8 @@ for num_layer in num_layer_option:
         padding_ratio=padding_ratio,
         z_input_to_first=float(z_input_to_first),
         base_wavelength_idx=base_wavelength_idx,
+        out_size=out_size,
+        padding_ratio_out=padding_ratio_out,
     ).to(device)
 
     losses: list[float] = []
@@ -735,7 +765,7 @@ for num_layer in num_layer_option:
         losses=losses,
         epoch_durations=epoch_durations,
         out_dir=training_output_dir,
-        tag=f"staged_multiwl_m{num_modes}_L{L}_ls{layer_size}_nlayer{num_layer}_{run_tag}",
+        tag=f"multiwl_m{num_modes}_{L}wl_sp{wl_spacing_nm:.1f}nm_ls{layer_size}_{num_layer}L_{run_tag}",
         num_layers=num_layer,
     )
     print(f"✔ Training curves saved -> {train_logs['loss_plot']}")
@@ -747,7 +777,8 @@ for num_layer in num_layer_option:
 
     # checkpoint
     ckpt_dir = RUN_ROOT / "checkpoints"
-    ckpt_path = ckpt_dir / f"multiwl_{num_layer}layers_m{num_modes}_L{L}.pth"
+    ckpt_path = ckpt_dir / f"multiwl_{num_layer}L_m{num_modes}_{L}wl_{wl_start_nm:.0f}nm_sp{wl_spacing_nm:.1f}nm.pth"
+
     save_checkpoint_multiwl(
         model,
         ckpt_path,
@@ -757,6 +788,10 @@ for num_layer in num_layer_option:
             "num_modes": int(num_modes),
             "num_wavelengths": int(L),
             "wavelengths": wavelengths.astype(np.float32),
+            "out_size": int(out_size),
+            "padding_ratio_out": float(padding_ratio_out),
+            "wl_start_nm": float(wl_start_nm),
+            "wl_spacing_nm": float(wl_spacing_nm),
             "total_training_time_sec": float(total_time),
         },
     )
@@ -765,16 +800,18 @@ for num_layer in num_layer_option:
     # 相位掩模
     phase_masks = extract_phase_masks_multiwl(model)
     if phase_masks:
-        pm_dir = RUN_ROOT / "phase_masks" / f"L{num_layer}_{run_tag}"
-        pm_dir.mkdir(parents=True, exist_ok=True)
-        pm_mat = pm_dir / "phase_masks.mat"
+        pm_dir = RUN_ROOT / "phase_masks" / f"{num_layer}L_{L}wl_{wl_start_nm:.0f}nm_sp{wl_spacing_nm:.1f}nm"
+        pm_mat = pm_dir / f"phase_masks_{num_layer}L_{L}wl_{wl_start_nm:.0f}nm.mat"
+        base_name=f"mask_{num_layer}L_{L}wl_{wl_start_nm:.0f}nm_sp{wl_spacing_nm:.1f}nm"
+        pm_dir.mkdir(parents=True, exist_ok=True)  
+
         savemat(str(pm_mat), {"phase_masks": np.stack(phase_masks, axis=0).astype(np.float32)})
         print(f"✔ Phase masks saved -> {pm_mat}")
 
         png_paths = visualize_phase_masks(
             phase_masks,
             out_dir=pm_dir,
-            base_name=f"phase_mask_L{num_layer}",
+            base_name=base_name,
             save_degree=False,
             dpi=300,
             cmap="twilight",
@@ -783,7 +820,7 @@ for num_layer in num_layer_option:
         print(f"✔ Generated {len(png_paths)} phase mask PNGs -> {pm_dir}")
 
     # 预测可视化
-    diag_dir = RUN_ROOT / "prediction_viz" / f"L{num_layer}_{run_tag}"
+    diag_dir = RUN_ROOT / "prediction_viz" / f"{num_layer}L_{run_tag}"
     n_vis = min(num_pred_diag_samples, len(test_datasets_per_wl[0]))
     diag_paths = save_prediction_diagnostics_multiwl(
         model,
@@ -833,6 +870,8 @@ for num_layer in num_layer_option:
                 (1/4, 1/2, 3/4) for _ in range(num_layer)
             ),
             output_fractions=(0.2, 0.4, 0.6, 0.8),
+            out_size=out_size,
+            padding_ratio_out=padding_ratio_out,
         )
         print(f"  ✔ mode {mode_idx+1} slices -> {info['fig_path']}")
         print(f"  ✔ mode {mode_idx+1} .mat   -> {info['mat_path']}")
