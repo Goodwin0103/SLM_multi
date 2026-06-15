@@ -79,11 +79,10 @@ print("Using Device:", device)
 # Parameters
 # ============================================================
 field_size = 176
-layer_size = 300
-num_modes = 2
+num_modes = 6
 
-circle_focus_radius = 5
-circle_detectsize = 10
+circle_focus_radius = 15
+circle_detectsize = 25
 focus_radius = circle_focus_radius
 detectsize = circle_detectsize
 
@@ -93,25 +92,27 @@ evaluation_mode = "eigenmode"
 training_dataset_mode = "eigenmode"
 
 num_superposition_eval_samples = 1000
-num_superposition_train_samples = 100
+num_superposition_train_samples = 2
 superposition_eval_seed = 20240116
 superposition_train_seed = 20240115
 
 num_layer_option = [1, 2, 3, 4]
 
+layer_size = 300
+
 # SLM
-z_layers = 45e-3
+z_layers = 45.744e-3
 pixel_size = 12.5e-6
-z_prop = 20e-2
-z_input_to_first = 0
-out_size = 600
+z_prop = 130e-3
+z_input_to_first = 2*z_layers
+out_size = 500
 padding_ratio_out = 0.5
 
 # ============================================================
 # Wavelengths (MultiWL) — 起始波长 + 间隔 + 数量
 # ============================================================
-wl_start_nm = 1550       # 起始波长 (nm)
-wl_spacing_nm = 0.5         # 波长间隔 (nm)
+wl_start_nm = 654       # 起始波长 (nm)
+wl_spacing_nm = 198       # 波长间隔 (nm)
 wl_count = 2                # 波长数量
 base_wavelength_idx = 0     # 基准波长索引
 
@@ -145,7 +146,7 @@ RUN_ROOT = Path(
     f"{num_modes}modes/"
     f"{L}wl_{wl_start_nm:.1f}nm_sp{wl_spacing_nm:.1f}nm_"
     f"base{base_wavelength_idx}_"
-    f"ls{layer_size}_out_{out_size}_zp{z_prop*1e3:.0f}mm_z{z_layers*1e3:.1f}mm_"
+    f"ls{layer_size}_out_{out_size}_zp{z_prop*1e3:.0f}mm_z{z_layers*1e3:.1f}mm_zin{z_input_to_first*1e3:.1f}mm_"
     f"pr{padding_ratio}_c{circle_focus_radius}_"
     f"{timestamp}"
 )
@@ -797,17 +798,68 @@ for num_layer in num_layer_option:
     )
     print("✔ Checkpoint saved ->", ckpt_path)
 
-    # 相位掩模
+    # phase_masks
     phase_masks = extract_phase_masks_multiwl(model)
     if phase_masks:
-        pm_dir = RUN_ROOT / "phase_masks" / f"{num_layer}L_{L}wl_{wl_start_nm:.0f}nm_sp{wl_spacing_nm:.1f}nm"
-        pm_mat = pm_dir / f"phase_masks_{num_layer}L_{L}wl_{wl_start_nm:.0f}nm.mat"
-        base_name=f"mask_{num_layer}L_{L}wl_{wl_start_nm:.0f}nm_sp{wl_spacing_nm:.1f}nm"
-        pm_dir.mkdir(parents=True, exist_ok=True)  
+        # ★ 完整参数命名规则
+        # 包含：模式数、层数、波长信息、画布尺寸、传播距离、像素尺寸、ROI 参数、时间戳
+        param_str = (
+            f"m{num_modes}"                        # 模式数
+            f"_{num_layer}L"                        # 衍射层数
+            f"_{L}wl{wl_start_nm:.0f}nm"            # 波长数 + 起始波长
+            f"sp{wl_spacing_nm:.0f}nm"              # 波长间隔
+            f"_ls{layer_size}"                      # 层画布尺寸
+            f"_out{out_size}"                       # 输出画布尺寸
+            f"_pr{padding_ratio}"                   # padding 比例
+            f"_zin{z_input_to_first*1e3:.1f}mm"     # 输入到第一层
+            f"_zL{z_layers*1e3:.1f}mm"              # 层间距
+            f"_zp{z_prop*1e3:.0f}mm"                # 最后一段传播
+            f"_dx{pixel_size*1e6:.1f}um"            # 像素尺寸
+            f"_r{circle_focus_radius}"              # ROI 半径
+            f"_d{circle_detectsize}"                # 探测器尺寸
+            f"_{run_tag}"                           # 时间戳
+        )
 
-        savemat(str(pm_mat), {"phase_masks": np.stack(phase_masks, axis=0).astype(np.float32)})
+        pm_dir = RUN_ROOT / "phase_masks" / f"{num_layer}L_run{run_tag}"
+        pm_dir.mkdir(parents=True, exist_ok=True)
+
+        # ★ .mat 文件名（带完整参数）
+        pm_mat = pm_dir / f"phase_masks_{param_str}.mat"
+        # ★ PNG 基础名（visualize_phase_masks 会自动加 _layer{i}.png 后缀）
+        base_name = f"mask_{param_str}"
+
+        # ★ 保存 .mat 时一并存入参数 dict，方便后续读取还原
+        mat_payload = {
+            "phase_masks": np.stack(phase_masks, axis=0).astype(np.float32),
+            # 元数据（标量都包成 1D array 以便 MATLAB 读取）
+            "num_modes": np.array([num_modes], dtype=np.int32),
+            "num_layers": np.array([num_layer], dtype=np.int32),
+            "num_wavelengths": np.array([L], dtype=np.int32),
+            "wavelengths_nm": (wavelengths * 1e9).astype(np.float64),
+            "wl_start_nm": np.array([wl_start_nm], dtype=np.float64),
+            "wl_spacing_nm": np.array([wl_spacing_nm], dtype=np.float64),
+            "base_wavelength_idx": np.array([base_wavelength_idx], dtype=np.int32),
+            "layer_size": np.array([layer_size], dtype=np.int32),
+            "out_size": np.array([out_size], dtype=np.int32),
+            "pixel_size_m": np.array([pixel_size], dtype=np.float64),
+            "padding_ratio": np.array([padding_ratio], dtype=np.float64),
+            "padding_ratio_out": np.array([padding_ratio_out], dtype=np.float64),
+            "z_input_to_first_m": np.array([z_input_to_first], dtype=np.float64),
+            "z_layers_m": np.array([z_layers], dtype=np.float64),
+            "z_prop_m": np.array([z_prop], dtype=np.float64),
+            "circle_focus_radius_px": np.array([circle_focus_radius], dtype=np.int32),
+            "circle_detectsize_px": np.array([circle_detectsize], dtype=np.int32),
+            "epochs": np.array([epochs], dtype=np.int32),
+            "lr": np.array([lr], dtype=np.float64),
+            "batch_size": np.array([batch_size], dtype=np.int32),
+            "seed": np.array([SEED], dtype=np.int32),
+            "timestamp": np.array([run_tag]),
+        }
+
+        savemat(str(pm_mat), mat_payload)
         print(f"✔ Phase masks saved -> {pm_mat}")
 
+        # ★ PNG 可视化
         png_paths = visualize_phase_masks(
             phase_masks,
             out_dir=pm_dir,
@@ -818,6 +870,7 @@ for num_layer in num_layer_option:
             show_stats=True,
         )
         print(f"✔ Generated {len(png_paths)} phase mask PNGs -> {pm_dir}")
+
 
     # 预测可视化
     diag_dir = RUN_ROOT / "prediction_viz" / f"{num_layer}L_{run_tag}"
