@@ -1,0 +1,31 @@
+Environment for running mainfor6.py 
+
+Python
+- Python 3.10+ recommended
+
+Required Python packages (pip)
+- torch (CPU or CUDA build)
+- torchvision
+- numpy
+- scipy
+- pandas
+- matplotlib
+- h5py
+- mat73
+- imageio
+- scikit-image
+- openpyxl (only if exporting Excel files)
+
+Quick install (CPU-only example)
+pip install "torch==2.2.*"
+pip install torchvision numpy scipy pandas matplotlib h5py mat73 imageio scikit-image openpyxl
+
+GPU note
+- Install the CUDA 
+- In mainfor6.py, set device to your GPU (example: cuda:0)
+
+Required data file (same folder as mainfor6.py)
+- mmf_6modes_25_PD_1.15.mat
+
+Run
+python mainfor6.py

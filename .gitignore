@@ -1,0 +1,27 @@
+# IDE / tools
+    .claude/
+    .cursor/
+    .vscode/
+    .idea/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# Virtual env
+venv/
+
+# Old worktree reference (already removed)
+.git
+
+# Frontend temp / cache
+frontend/temp/
+frontend/logs/
+frontend/__pycache__/
+
+results/
+checkpoints/

@@ -1,0 +1,460 @@
+---
+alwaysApply: true
+description: Enforce modern, performant, and maintainable Streamlit development practices for the ODNN Frontend, focusing on the Adapter pattern, modularity, strict naming conventions, and robust state management.
+globs: frontend/**/*.py, frontend/**/*.md
+---
+
+# ODNN Streamlit Frontend Best Practices
+
+本指南规定了 ODNN 衍射神经网络前端系统的 Streamlit 开发最佳实践。该系统需要解耦前端 UI 与后端深度学习训练脚本（如 `mainfor6.py`, `mainfor55.py`），因此必须严格遵循适配器模式（Adapter Pattern）和模块化设计。前端代码全部放到frontend独立目录下。主程序(比如mainfor6.py, mainfor6_super.py等)尽量保持不变(或最小修改)。
+UI外观要简单直观，文字不要出现任何中文，全部用英文。整个代码里不要出现emoji符号，注释可以中英语混合，注释不要AI味很浓，要像是真人写的。
+
+## 1. 代码组织与架构 (Code Organization and Structure)
+
+严格遵循单一职责原则（Single Responsibility）。前端界面绝对不能直接包含或直接调用底层训练/测试的复杂计算逻辑，必须通过适配器（Adapters）和配置管理器进行通信。
+
+### 1.1 项目目录结构
+
+❌ BAD: 混乱的单体文件或直接在页面中写训练逻辑
+
+```python
+# app.py
+import streamlit as st
+from mainfor6 import run_training # 直接导入后端重度逻辑
+
+st.title("ODNN Training")
+if st.button("Start"):
+    run_training(epochs=100) # 阻塞主线程，UI卡死
+```
+✅ GOOD: 基于适配器模式的模块化结构
+
+```
+frontend/
+├── app.py                  # 主入口，管理路由和页面配置
+├── pages/                  # 各个独立页面
+│   ├── training.py
+│   ├── testing.py
+│   └── results_viewer.py
+├── components/             # 可复用的 Streamlit UI 组件
+│   └── custom_widgets.py
+├── adapters/               # 核心层：连接 UI 与后端算法
+│   ├── base_adapter.py     # 适配器基类 (Interface)
+│   ├── mainfor6_adapter.py # mainfor6 的具体适配器
+│   └── mainfor55_adapter.py
+├── services/               # 业务与数据服务
+│   └── config_manager.py   # JSON 配置文件管理
+├── utils/                  # 辅助工具 (日志解析等)
+├── requirements.txt
+└── .gitignore
+```
+
+
+### 1.2 架构模式：依赖倒置与适配器 (Adapter Pattern)
+前端必须对修改关闭，对扩展开放。当新增训练脚本（如 mainfor6_super.py）时，只需新建适配器，不得修改前端核心逻辑。
+
+✅ GOOD: 适配器接口设计
+
+```python
+# adapters/base_adapter.py
+from abc import ABC, abstractmethod
+from typing import Dict, Any
+
+class BaseODNNAdapter(ABC):
+    @abstractmethod
+    def load_default_config(self) -> Dict[str, Any]:
+        pass
+        
+    @abstractmethod
+    def start_training(self, config: Dict[str, Any]) -> None:
+        pass
+
+# pages/training.py
+import streamlit as st
+from adapters.mainfor6_adapter import Mainfor6Adapter
+
+def main():
+    adapter = Mainfor6Adapter()
+    config = adapter.load_default_config()
+    # ... 渲染 UI 收集用户修改的 config ...
+    if st.button("Start Training"):
+        adapter.start_training(config)
+```
+
+## 2. 命名规范 (Naming Conventions)
+必须严格遵守以下命名约定：
+文件名 (Files): snake_case (例如: config_manager.py, mainfor6_adapter.py)
+类名 (Classes): PascalCase (例如: ConfigManager, Mainfor6Adapter)
+函数与变量名 (Functions/Variables): snake_case (例如: load_config, training_status)
+常量 (Constants): UPPER_CASE (例如: MAX_HISTORY_POINTS, DEFAULT_EPOCHS)
+
+## 3. 性能与状态管理 (Performance & State)
+Streamlit 在每次交互时都会重新运行脚本。对于 ODNN 这种涉及大文件读取（如 .mat 模场文件、.npz 权重）的系统，必须严格管理缓存和状态。
+
+### 3.1 缓存重量级操作
+加载基准配置、读取历史训练结果或加载 .mat 评估数据时，必须使用 @st.cache_data。
+
+✅ GOOD:
+
+```python
+import streamlit as st
+import numpy as np
+from scipy.io import loadmat
+
+@st.cache_data
+def load_mat_data(file_path: str) -> np.ndarray:
+    """加载并缓存光场/掩模矩阵数据"""
+    data = loadmat(file_path)
+    return data['matrix_key']
+```
+
+### 3.2 训练参数与状态管理
+表单输入、当前选择的适配器模型等，必须存储在 st.session_state 中，避免页面切换或重绘时丢失。
+
+✅ GOOD:
+
+```python
+import streamlit as st
+
+if 'current_config' not in st.session_state:
+    st.session_state.current_config = load_default_config()
+
+if 'is_training' not in st.session_state:
+    st.session_state.is_training = False
+```
+
+## 4. UI 渲染与逻辑分离 (Separate UI from Logic)
+在 pages/ 目录下的文件中编写 UI 渲染逻辑，在 adapters/ 和 services/ 中处理数据。
+
+❌ BAD: 混合逻辑
+
+```python
+# 在页面代码中直接处理 JSON 文件并渲染
+import json
+import streamlit as st
+
+with open("config.json", "r") as f:
+    data = json.load(f)
+    if not data:
+        data = {"epoch": 100} # 缺失处理混在 UI 中
+st.write(data["epoch"])
+```
+
+✅ GOOD: 逻辑下沉到 Service，容错处理独立
+
+```python
+# services/config_manager.py
+import json
+from typing import Dict, Any
+
+class ConfigManager:
+    def load_config(self, path: str) -> Dict[str, Any]:
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except FileNotFoundError:
+            return self.get_default_config() # 容错：配置文件缺失时使用默认配置
+
+# pages/training.py
+from services.config_manager import ConfigManager
+import streamlit as st
+
+config = ConfigManager().load_config("config.json")
+st.write(config["epoch"])
+```
+
+### 4.2 Config 字段兼容性契约 (Field Compatibility Contract)
+
+当向 `DEFAULTS` 字典中添加新参数时（比如 `dropout_rate`），旧版本的 `train_config.json` 里不存在该字段。
+`ConfigManager.merge_with_defaults()` 会自动用 `DEFAULTS` 的值填补缺失字段，保证向后兼容。
+
+**规则：**
+1. 页面初始化时**必须**调用 `merge_with_defaults`，不得直接使用 `load_config()` 的原始返回值
+2. 新增参数只需在页面的 `DEFAULTS` 字典和 `mainfor6.py` 的 `config.get(...)` 中同步添加，无需迁移脚本
+3. 禁止在 UI 代码中直接 `open("config.json")` 读写，必须通过 `ConfigManager`
+
+✅ GOOD: 页面初始化
+
+```python
+# pages/training.py
+if "train_config" not in st.session_state:
+    mgr = ConfigManager(CONFIG_PATH)
+    saved = mgr.load_config()                          # 可能是旧版本，缺新字段
+    st.session_state.train_config = mgr.merge_with_defaults(saved, DEFAULTS)  # 补全
+
+# 之后直接用 st.session_state.train_config，所有字段都保证存在
+```
+
+❌ BAD: 绕过 merge_with_defaults
+
+```python
+# 直接使用 load_config() 结果，遇到旧配置文件时 KeyError
+with open(CONFIG_PATH) as f:
+    cfg = json.load(f)
+epochs = cfg["dropout_rate"]  # 旧文件没有这个字段，KeyError
+```
+
+## 5. 类型提示 (Type Hints)
+Python 核心逻辑（尤其是 Adapter 和 Service 层）必须使用完整的类型提示。这对于维护包含复杂张量操作、超参数配置的 ODNN 系统至关重要。
+
+✅ GOOD:
+
+```python
+from typing import Dict, List, Union
+import numpy as np
+
+def process_evaluation_results(metrics: Dict[str, Union[float, np.ndarray]]) -> List[float]:
+    pass
+```
+
+## 6. 错误处理策略 (Error Handling Strategy)
+根据项目需求，前端必须实现防御性编程：
+配置文件缺失：捕获异常并使用系统默认配置。
+日志文件读取失败：记录警告，跳过本次更新（不阻断轮询）。
+训练脚本崩溃：读取 `training.log` 末尾 N 行，检测 Error/Traceback 关键字，用 `st.error` + `st.expander` 展示。
+结果文件缺失：显示友好的空状态（Empty State）提示。
+
+✅ GOOD: 训练结束后的错误可观测性
+
+```python
+# pages/training.py
+def _render_training_status() -> None:
+    if st.session_state.is_training:
+        st.info(f"Training in progress  (PID {st.session_state.training_pid})")
+        return
+
+    if METRICS_PATH.exists() and METRICS_PATH.stat().st_size > 0:
+        log_lines = adapter.read_log_tail(50)
+        has_error = any(
+            kw in line for line in log_lines for kw in ("Error", "Traceback", "Exception")
+        )
+        if has_error:
+            st.error("Training stopped with errors. See details below.")
+            with st.expander("Training log (last 50 lines)"):
+                st.code("\n".join(log_lines), language="text")
+        else:
+            st.success("Training finished.")
+    else:
+        st.caption("Status: idle")
+
+# adapters/mainfor6_adapter.py
+def read_log_tail(self, n: int = 50) -> list[str]:
+    if not _TRAINING_LOG.exists():
+        return []
+    try:
+        lines = _TRAINING_LOG.read_text(encoding="utf-8", errors="replace").splitlines()
+        return lines[-n:]
+    except OSError:
+        return []
+```
+
+注意：不能仅凭 `metrics.jsonl` 有数据就显示 `st.success`——进程可能已崩溃但在崩溃前写过几行指标。必须以日志关键字判断最终状态。
+
+## 7. 布局上下文管理器 (Layout Context Managers)
+优先使用 st.sidebar, st.columns, st.tabs 等构建整洁的配置面板与图表区域。避免手动管理复杂的间距。
+
+✅ GOOD:
+
+```python
+import streamlit as st
+
+with st.sidebar:
+    st.header("全局设置")
+    model_type = st.selectbox("选择底层脚本", ["mainfor6", "mainfor55"])
+
+tab1, tab2 = st.tabs(["训练参数", "光场预览"])
+with tab1:
+    col1, col2 = st.columns(2)
+    with col1:
+        st.number_input("Epochs")
+    with col2:
+        st.number_input("Batch Size")
+```
+
+## 8. 异步训练架构 (Asynchronous Training Architecture)
+
+训练必须在独立进程/线程中运行，前端通过轮询日志文件或进程状态更新 UI。
+
+✅ GOOD: 基于子进程 + 日志文件的方案
+
+```python
+# adapters/mainfor6_adapter.py
+import subprocess
+from pathlib import Path
+
+class Mainfor6Adapter(BaseODNNAdapter):
+    def start_training(self, config: Dict[str, Any]) -> None:
+        # 1. 将 config 写入 JSON
+        config_path = Path("frontend/temp/train_config.json")
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+        
+        # 2. 启动子进程（非阻塞）
+        log_file = Path("frontend/logs/training.log")
+        # open log file; parent closes fd after Popen, child keeps its copy
+        with open(log_file, "w") as log_fh:
+            process = subprocess.Popen(
+                [sys.executable, str(PROJECT_ROOT / "mainfor6.py"),
+                 "--config", str(config_path), "--mat_file", mat_file],
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                cwd=str(PROJECT_ROOT),
+            )
+        
+        # 3. 保存进程信息到 session_state
+        st.session_state.training_pid = process.pid
+        st.session_state.log_file = log_file
+
+# pages/training.py
+def monitor_training():
+    if 'training_pid' in st.session_state:
+        # 每 2 秒轮询日志文件
+        log_data = parse_training_log(st.session_state.log_file)
+        st.line_chart(log_data['loss_history'])
+        
+st_autorefresh(interval=2000, key="training_monitor")
+```
+
+修改主程序建议：在 mainfor6.py 中添加：
+
+```python
+# 在训练循环中定期将 loss 写入 JSON（供前端读取）
+if epoch % 10 == 0:
+    metrics = {"epoch": epoch, "loss": loss.item(), "timestamp": time.time()}
+    with open("frontend/logs/metrics.jsonl", "a") as f:
+        f.write(json.dumps(metrics) + "\n")
+```
+
+
+## 9. 实时图表与数据流 (Real-time Charting & Data Streaming)
+
+使用 `streamlit-autorefresh` 驱动轮询，**禁止使用 `while True + time.sleep`**。
+`while True + time.sleep` 会阻塞 Streamlit 的渲染线程，导致 UI 完全无响应。
+正确做法是让 `st_autorefresh` 触发页面 rerun，每次 rerun 时读取一次日志文件并渲染。
+
+✅ GOOD: st_autorefresh 驱动的增量渲染
+
+```python
+# utils/log_parser.py
+def parse_metrics_jsonl(log_path: Path, max_points: int = 1000) -> pd.DataFrame:
+    """读取 metrics.jsonl，返回最近 max_points 条记录的 DataFrame."""
+    if not log_path.exists():
+        return pd.DataFrame()
+    records = []
+    try:
+        with open(log_path, "r") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    try:
+                        records.append(json.loads(line))
+                    except json.JSONDecodeError:
+                        continue
+    except OSError:
+        return pd.DataFrame()
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame(records).tail(max_points).reset_index(drop=True)
+
+# pages/training.py -- st_autorefresh 触发 rerun，每次 rerun 读一次文件
+if st.session_state.is_training:
+    st_autorefresh(interval=1000, key="training_monitor")
+
+df = parse_metrics_jsonl(METRICS_PATH)
+if not df.empty:
+    col1, col2 = st.columns(2)
+    with col1:
+        st.line_chart(df.set_index("epoch")["loss"])
+    with col2:
+        st.metric("Latest Loss", f"{df.iloc[-1]['loss']:.6f}")
+```
+
+❌ BAD: while + time.sleep 阻塞渲染线程
+
+```python
+# 绝对不能这样写 -- UI 完全卡死
+while st.session_state.is_training:
+    df = parse_metrics_jsonl(METRICS_PATH)
+    st.line_chart(df.set_index("epoch")["loss"])
+    time.sleep(2)
+```
+
+
+## 10. 测试结果可视化 (Test Result Visualization)
+
+必须实现光场对比、误差热图等专用组件。
+
+✅ GOOD: 封装图像对比组件
+
+```python
+# components/field_comparison.py
+import streamlit as st
+import matplotlib.pyplot as plt
+
+def render_field_comparison(detector_field: np.ndarray, 
+                            label_field: np.ndarray,
+                            title: str = "Detector vs Label"):
+    """渲染探测器光场与标签的并排对比"""
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    
+    # 探测器输出
+    im1 = axes[0].imshow(detector_field, cmap='hot')
+    axes[0].set_title("Detector Output")
+    plt.colorbar(im1, ax=axes[0])
+    
+    # Label
+    im2 = axes[1].imshow(label_field, cmap='hot')
+    axes[1].set_title("Ground Truth Label")
+    plt.colorbar(im2, ax=axes[1])
+    
+    # 差值热图
+    diff = np.abs(detector_field - label_field)
+    im3 = axes[2].imshow(diff, cmap='seismic')
+    axes[2].set_title("Absolute Error")
+    plt.colorbar(im3, ax=axes[2])
+    
+    st.pyplot(fig)
+
+# pages/testing.py
+from components.field_comparison import render_field_comparison
+
+detector_output = adapter.run_inference(test_sample)
+render_field_comparison(detector_output, test_sample['label'])
+```
+
+
+## 11. 主程序适配接口规范 (Main Script Adaptation Contract)
+
+为了最小化主程序修改，必须约定以下接口：
+
+### 必须支持的命令行参数：
+python mainfor6.py --config <path_to_json> --output_dir <results_dir>
+
+### 必须输出的文件（供前端读取）：
+1. frontend/logs/metrics.jsonl  # 训练指标（每 N epoch 追加一行）
+2. frontend/results/final_model.pth  # 最终模型权重
+3. frontend/results/test_metrics.json  # 测试指标汇总
+
+### mainfor6.py 最小修改示例：
+
+```python
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, default=None)
+    args = parser.parse_args()
+    
+    if args.config:
+        with open(args.config) as f:
+            config = json.load(f)
+        # 扁平化读取所有参数
+        epochs = config.get('epochs', 100)
+        learning_rate = config.get('learning_rate', 0.001)
+        layer_size = config.get('layer_size', 110)
+        num_layers = config.get('num_layers', 3)
+        padding_ratio = config.get('padding_ratio', 0.5)
+        # ... 其他参数 ...
+    else:
+        # 保持原有的硬编码参数逻辑
+        epochs = 100
+        layer_size = 110
+```
