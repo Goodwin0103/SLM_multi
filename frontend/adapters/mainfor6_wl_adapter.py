@@ -509,7 +509,8 @@ class Mainfor6WLAdapter(BaseODNNAdapter):
 
         # -- input plane -------------------------------------------------
         ef = eigenmode_field.to(device=device, dtype=torch.complex64)
-        padded = pad_field_to_layer(ef, layer_size)
+        while ef.ndim > 2:
+            ef = ef.squeeze(0)
         field = padded[None, None, ...].repeat(1, L, 1, 1).contiguous()  # (1, L, H, W)
         H, W = int(field.shape[-2]), int(field.shape[-1])
 
