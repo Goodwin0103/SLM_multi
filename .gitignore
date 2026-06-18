@@ -3,6 +3,7 @@
     .cursor/
     .vscode/
     .idea/
+.cursor/rules/frontend.mdc
 
 # Python
 __pycache__/
