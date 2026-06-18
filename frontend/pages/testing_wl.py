@@ -20,6 +20,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from adapters.mainfor6_wl_adapter import Mainfor6WLAdapter
+from adapters.remote_adapter import RemoteAdapter, load_remote_config
 from components.propagation_viewer import (
     render_propagation_timeline,
     render_propagation_player,
@@ -124,6 +125,38 @@ def _render_model_section(adapter: Mainfor6WLAdapter) -> None:
             st.caption("Must be a .pth file.")
         else:
             st.caption("File not found.")
+
+    # -- fetch checkpoint from remote server --------------------------------
+    remote_cfg = load_remote_config()
+    if remote_cfg:
+        with st.expander("Fetch from Server", expanded=False):
+            try:
+                radapter = RemoteAdapter(
+                    host=remote_cfg["host"], user=remote_cfg["user"],
+                    project_dir=remote_cfg.get("project_dir", ""),
+                    workspace_dir=remote_cfg.get("workspace_dir", ""),
+                    conda_env=remote_cfg.get("conda_env", "odnn"),
+                    port=int(remote_cfg.get("port", 22)),
+                )
+                remote_ckpts = radapter.list_checkpoints()
+                if remote_ckpts:
+                    ckpt_display = [p.split("/")[-1] + "  (" + p + ")" for p in remote_ckpts]
+                    sel_remote = st.selectbox("Server checkpoints", ckpt_display, key="wl_fetch_ckpt")
+                    if st.button("Download selected checkpoint"):
+                        sel_idx = ckpt_display.index(sel_remote)
+                        sel_path = remote_ckpts[sel_idx]
+                        local_dir = _PROJECT_ROOT / "checkpoints"
+                        with st.spinner(f"Downloading from server..."):
+                            local_pth = radapter.download_checkpoint(sel_path, str(local_dir))
+                        st.success(f"Downloaded: {local_pth}")
+                        st.session_state.wl_selected_ckpt = local_pth
+                        st.session_state.wl_ckpt_meta = radapter.load_checkpoint_meta(sel_path)
+                        st.session_state.wl_test_result = None
+                        st.rerun()
+                else:
+                    st.caption("No checkpoints found on server.")
+            except Exception as exc:
+                st.caption(f"Could not connect: {exc}")
 
     # -- model info --------------------------------------------------------
     meta = st.session_state.wl_ckpt_meta

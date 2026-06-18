@@ -19,8 +19,11 @@ testing_page      = st.Page("pages/testing.py",      title="Testing")
 training_wl_page  = st.Page("pages/training_wl.py",  title="Multi-WL Training")
 testing_wl_page   = st.Page("pages/testing_wl.py",   title="Multi-WL Testing")
 analysis_page     = st.Page("pages/analysis.py",     title="Analysis")
+gpu_monitor_page  = st.Page("pages/gpu_monitor.py",  title="GPU Monitor")
+settings_page     = st.Page("pages/settings.py",     title="Settings")
 
 pg = st.navigation([
-    training_page, testing_page, training_wl_page, testing_wl_page, analysis_page
+    training_page, testing_page, training_wl_page, testing_wl_page,
+    analysis_page, gpu_monitor_page, settings_page,
 ], position="sidebar")
 pg.run()

@@ -158,6 +158,7 @@ def train_multiwl_staged(
     verbose: bool = True,
     num_layer: int = 1,
     total_layers: int = 1,
+    metrics_path: str = "",
 ) -> Dict[str, any]:
     """
     多波长D2NN模型训练（所有波长同时训练 + 边缘波长加权）
@@ -293,7 +294,9 @@ def train_multiwl_staged(
         _overall_epoch = (num_layer - 1) * epochs + epoch
         _overall_total = total_layers * epochs
         _overall_etr = (_t_elapsed / epoch) * (_overall_total - _overall_epoch) if epoch > 0 else 0.0
-        _metrics_path = Path(__file__).resolve().parent / "frontend" / "logs" / "metrics_wl.jsonl"
+        _metrics_path = Path(metrics_path) if metrics_path else (
+            Path(__file__).resolve().parent / "frontend" / "logs" / "metrics_wl.jsonl"
+        )
         _metrics_path.parent.mkdir(parents=True, exist_ok=True)
         with open(_metrics_path, "a") as _mf:
             _mf.write(json.dumps({

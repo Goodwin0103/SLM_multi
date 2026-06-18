@@ -19,6 +19,7 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from adapters.mainfor6_wl_adapter import Mainfor6WLAdapter
+from adapters.remote_adapter import RemoteAdapter, load_remote_config
 from services.config_manager import ConfigManager
 from utils.log_parser import latest_metrics, parse_metrics_jsonl
 from utils.time_utils import fmt_seconds
@@ -28,6 +29,7 @@ TEMP_DIR     = _FRONTEND_DIR / "temp"
 LOG_DIR      = _FRONTEND_DIR / "logs"
 CONFIG_PATH  = TEMP_DIR / "train_config_wl.json"
 METRICS_PATH = LOG_DIR / "metrics_wl.jsonl"
+REMOTE_METRICS_PATH = Path("/tmp/odnn_remote_metrics_wl.jsonl")
 
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -110,6 +112,13 @@ def _load_mode_preview(
 # ---------------------------------------------------------------------------
 
 def _init_state() -> None:
+    if "wl_compute_mode" not in st.session_state:
+        st.session_state.wl_compute_mode = "Local"
+    if "wl_remote_job_id" not in st.session_state:
+        st.session_state.wl_remote_job_id = None
+    if "wl_remote_adapter" not in st.session_state:
+        st.session_state.wl_remote_adapter = None
+
     if "wl_adapter" not in st.session_state:
         st.session_state.wl_adapter = Mainfor6WLAdapter()
 
@@ -139,6 +148,23 @@ def _init_state() -> None:
     if "wl_param_layers_text" not in st.session_state:
         layers_list = cfg.get("num_layers_list", [1, 2, 3, 4, 5])
         st.session_state["wl_param_layers_text"] = ", ".join(str(l) for l in layers_list)
+
+
+def _get_adapter():
+    """Return the active adapter based on compute mode."""
+    if st.session_state.wl_compute_mode == "Remote":
+        if st.session_state.wl_remote_adapter is None:
+            cfg = load_remote_config()
+            if cfg:
+                st.session_state.wl_remote_adapter = RemoteAdapter(
+                    host=cfg["host"], user=cfg["user"],
+                    project_dir=cfg.get("project_dir", ""),
+                    workspace_dir=cfg.get("workspace_dir", ""),
+                    conda_env=cfg.get("conda_env", "odnn"),
+                    port=int(cfg.get("port", 22)),
+                )
+        return st.session_state.wl_remote_adapter
+    return st.session_state.wl_adapter
 
 
 # ---------------------------------------------------------------------------
@@ -355,39 +381,67 @@ def _do_start_training() -> None:
     mat_path = st.session_state.mat_file_path
     assert mat_path, "Start button must be disabled when no .mat file is loaded"
 
-    METRICS_PATH.write_text("")
     st.session_state.training_error = None
+    adapter = _get_adapter()
+
+    is_remote = st.session_state.wl_compute_mode == "Remote"
+
+    if is_remote:
+        if adapter is None:
+            st.session_state.training_error = "Remote server not configured. Go to Settings first."
+            return
+        REMOTE_METRICS_PATH.write_text("")
+    else:
+        METRICS_PATH.write_text("")
 
     try:
-        pid = st.session_state.wl_adapter.start_training(cfg, mat_file=mat_path)
+        result = adapter.start_training(cfg, mat_file=mat_path)
     except Exception as exc:
         st.session_state.training_error = str(exc)
         return
 
-    st.session_state.training_pid = pid
-    st.session_state.is_training  = True
+    if is_remote:
+        st.session_state.wl_remote_job_id = result
+    else:
+        st.session_state.training_pid = result
+    st.session_state.is_training = True
 
 
 def _do_stop_training() -> None:
-    pid = st.session_state.training_pid
-    if pid:
-        st.session_state.wl_adapter.stop_training(pid)
-    st.session_state.is_training  = False
-    st.session_state.training_pid = None
+    adapter = _get_adapter()
+    is_remote = st.session_state.wl_compute_mode == "Remote"
+
+    if is_remote:
+        job_id = st.session_state.wl_remote_job_id
+        if job_id and adapter:
+            adapter.stop_training(job_id)
+        st.session_state.wl_remote_job_id = None
+    else:
+        pid = st.session_state.training_pid
+        if pid:
+            adapter.stop_training(pid)
+        st.session_state.training_pid = None
+
+    st.session_state.is_training = False
 
 
 def _render_training_status() -> None:
-    adapter = st.session_state.wl_adapter
+    adapter = _get_adapter()
+    is_remote = st.session_state.wl_compute_mode == "Remote"
 
     if st.session_state.training_error:
         st.error(f"Failed to start training: {st.session_state.training_error}")
         return
 
     if st.session_state.is_training:
-        st.info(f"Training in progress  (PID {st.session_state.training_pid})")
+        if is_remote:
+            st.info(f"Training in progress  (Job: {st.session_state.wl_remote_job_id})")
+        else:
+            st.info(f"Training in progress  (PID {st.session_state.training_pid})")
         return
 
-    if METRICS_PATH.exists() and METRICS_PATH.stat().st_size > 0:
+    metrics_path = REMOTE_METRICS_PATH if is_remote else METRICS_PATH
+    if metrics_path.exists() and metrics_path.stat().st_size > 0:
         log_lines = adapter.read_log_tail(50)
         has_error = any(
             kw in line for line in log_lines for kw in ("Error", "Traceback", "Exception")
@@ -405,19 +459,48 @@ def _render_training_status() -> None:
 def _section_training() -> None:
     st.subheader("3. Training")
 
-    adapter = st.session_state.wl_adapter
+    adapter     = _get_adapter()
+    is_remote   = st.session_state.wl_compute_mode == "Remote"
+    job_id      = st.session_state.wl_remote_job_id if is_remote else None
 
-    if st.session_state.is_training and st.session_state.training_pid:
-        if not adapter.is_training_alive(st.session_state.training_pid):
-            st.session_state.is_training  = False
-            st.session_state.training_pid = None
+    # -- liveness check ----------------------------------------------------
+    if st.session_state.is_training:
+        alive = False
+        if is_remote and job_id and adapter:
+            try:
+                alive = adapter.is_training_alive(job_id)
+            except Exception:
+                alive = False
+        elif not is_remote and st.session_state.training_pid:
+            alive = adapter.is_training_alive(st.session_state.training_pid)
+
+        if not alive:
+            st.session_state.is_training = False
+            if is_remote:
+                st.session_state.wl_remote_job_id = None
+            else:
+                st.session_state.training_pid = None
 
     if st.session_state.is_training:
-        st_autorefresh(interval=1000, key="wl_training_monitor")
+        refresh_interval = 5000 if is_remote else 1000
+        st_autorefresh(interval=refresh_interval, key="wl_training_monitor")
+
+        # remote: fetch metrics from server and cache locally
+        if is_remote and adapter and job_id:
+            try:
+                raw = adapter.fetch_metrics_jsonl()
+                if raw.strip():
+                    REMOTE_METRICS_PATH.write_text(raw)
+            except Exception:
+                pass
 
     col_start, col_stop = st.columns([1, 1])
     with col_start:
-        disabled_start = st.session_state.is_training or (st.session_state.mat_file_path is None)
+        disabled_start = (
+            st.session_state.is_training
+            or (st.session_state.mat_file_path is None)
+            or (is_remote and adapter is None)
+        )
         if st.button("Start", type="primary", disabled=disabled_start):
             _do_start_training()
             st.rerun()
@@ -428,13 +511,15 @@ def _section_training() -> None:
 
     _render_training_status()
 
-    last = latest_metrics(METRICS_PATH)
+    # -- metrics display ----------------------------------------------------
+    metrics_path = REMOTE_METRICS_PATH if is_remote else METRICS_PATH
+    last = latest_metrics(metrics_path)
     if not last:
         if not st.session_state.is_training:
             st.caption("No metrics yet. Start training to see live data.")
         return
 
-    # --- overall progress (replaces per-layer progress) ---
+    # --- overall progress ---
     layer_now      = int(last.get("layer", 1))
     total_layers   = int(last.get("total_layers", 1))
     overall_epoch  = int(last.get("overall_epoch", 0))
@@ -460,7 +545,7 @@ def _section_training() -> None:
     m6.metric("ETR (overall)",  fmt_seconds(last.get("overall_etr", 0)))
 
     # --- charts: one pair per layer ---
-    df = parse_metrics_jsonl(METRICS_PATH)
+    df = parse_metrics_jsonl(metrics_path)
     if not df.empty and len(df) >= 2 and "layer" in df.columns:
         trained_layers = sorted(df["layer"].unique())
         for lyr in trained_layers:
@@ -470,7 +555,7 @@ def _section_training() -> None:
             st.markdown(f"**Layer {int(lyr)}**")
             chart_col1, chart_col2 = st.columns(2)
             with chart_col1:
-                st.caption(f"Loss vs Epoch")
+                st.caption("Loss vs Epoch")
                 loss_chart = (
                     alt.Chart(df_layer)
                     .mark_line()
@@ -482,7 +567,7 @@ def _section_training() -> None:
                 )
                 st.altair_chart(loss_chart)
             with chart_col2:
-                st.caption(f"Learning Rate vs Epoch")
+                st.caption("Learning Rate vs Epoch")
                 lr_chart = (
                     alt.Chart(df_layer)
                     .mark_line()
@@ -502,6 +587,13 @@ def _section_training() -> None:
 _init_state()
 
 st.title("Multi-WL Training")
+
+compute_mode = st.segmented_control(
+    "Compute", options=["Local", "Remote"],
+    key="wl_compute_mode",
+)
+st.session_state.wl_compute_mode = compute_mode
+
 st.divider()
 
 _section_load_data()

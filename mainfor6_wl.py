@@ -148,8 +148,9 @@ num_superposition_visual_samples = 2
 # frontend config override (--config + --mat_file)
 # ============================================================
 _p = argparse.ArgumentParser(add_help=False)
-_p.add_argument("--config",   type=str, default=None)
-_p.add_argument("--mat_file", type=str, default=None)
+_p.add_argument("--config",     type=str, default=None)
+_p.add_argument("--mat_file",   type=str, default=None)
+_p.add_argument("--output_dir", type=str, default=None)
 _cli, _ = _p.parse_known_args()
 
 _cfg: dict = {}
@@ -190,7 +191,10 @@ if _cfg:
         num_layer_option = [int(num_layers_list_cfg)]
     else:
         num_layer_option = [int(_cfg.get("num_layers", num_layer_option[0]))]
-    if _cfg.get("output_dir"):
+    if _cli.output_dir:
+        RUN_ROOT = Path(_cli.output_dir)
+        RUN_ROOT.mkdir(parents=True, exist_ok=True)
+    elif _cfg.get("output_dir"):
         RUN_ROOT = Path(_cfg["output_dir"])
         RUN_ROOT.mkdir(parents=True, exist_ok=True)
     else:
@@ -207,9 +211,16 @@ if _cfg:
         RUN_ROOT.mkdir(parents=True, exist_ok=True)
 
 # metrics log path for frontend monitoring
-_METRICS_LOG = Path(__file__).resolve().parent / "frontend" / "logs" / "metrics_wl.jsonl"
-_METRICS_LOG.parent.mkdir(parents=True, exist_ok=True)
-_METRICS_LOG.write_text("")
+if _cli.output_dir or _cfg.get("output_dir"):
+    _METRICS_LOG = RUN_ROOT / "logs" / "metrics_wl.jsonl"
+    _METRICS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    _METRICS_LOG.write_text("")
+    _train_log = RUN_ROOT / "logs" / "training_wl.log"
+else:
+    _METRICS_LOG = Path(__file__).resolve().parent / "frontend" / "logs" / "metrics_wl.jsonl"
+    _METRICS_LOG.parent.mkdir(parents=True, exist_ok=True)
+    _METRICS_LOG.write_text("")
+    _train_log = Path(__file__).resolve().parent / "frontend" / "logs" / "training_wl.log"
 
 # ============================================================
 # 多波长标签生成函数
@@ -798,6 +809,7 @@ for num_layer in num_layer_option:
         verbose=True,
         num_layer=num_layer,
         total_layers=len(num_layer_option),
+        metrics_path=str(_METRICS_LOG),
     )
 
     losses = training_result['losses']
