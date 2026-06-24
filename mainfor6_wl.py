@@ -73,7 +73,7 @@ torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 torch.use_deterministic_algorithms(True)
 
-device = torch.device("cuda:3") if torch.cuda.is_available() else torch.device("cpu")
+device = torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
 print("Using Device:", device)
 
 
@@ -857,6 +857,10 @@ for num_layer in num_layer_option:
             "padding_ratio_out": float(padding_ratio_out),
             "wl_start_nm": float(wl_start_nm),
             "wl_spacing_nm": float(wl_spacing_nm),
+            "circle_focus_radius": int(circle_focus_radius),
+            "margin_ratio": float(margin_ratio),
+            "phase_option": int(phase_option),
+            "circle_detectsize": int(circle_detectsize),
             "total_training_time_sec": float(total_time),
         },
     )

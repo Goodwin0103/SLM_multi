@@ -59,7 +59,7 @@ class RemoteAdapter(BaseODNNAdapter):
         SSH username.
     project_dir:
         Absolute path to the cloned ``ODNN`` repo on the server
-        (e.g. ``"/home/jslai/odnn_project"``).
+        (e.g. ``"/home/jslai/ODNN"``).
     workspace_dir:
         Absolute path to the per-user workspace on the server
         (e.g. ``"/home/jslai/odnn_workspace"``).
@@ -106,8 +106,13 @@ class RemoteAdapter(BaseODNNAdapter):
             self.ssh_target,
             remote_cmd,
         ]
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout,
-                              check=check)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if check and result.returncode != 0:
+            raise RuntimeError(
+                f"SSH command failed (exit {result.returncode}): "
+                + (result.stderr or result.stdout or "unknown").strip()
+            )
+        return result
 
     def _ssh_no_check(self, remote_cmd: str, timeout: int = 30) -> subprocess.CompletedProcess:
         """Run a remote command without raising on non-zero exit."""
@@ -124,7 +129,12 @@ class RemoteAdapter(BaseODNNAdapter):
             local_path,
             f"{self.ssh_target}:{remote_path}",
         ]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=60, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"scp upload failed (exit {result.returncode}): "
+                + (result.stderr or result.stdout or "unknown").strip()
+            )
 
     def _scp_download(self, remote_path: str, local_path: str) -> None:
         """Copy a file from the remote server to the local machine."""
@@ -138,7 +148,12 @@ class RemoteAdapter(BaseODNNAdapter):
             f"{self.ssh_target}:{remote_path}",
             local_path,
         ]
-        subprocess.run(cmd, capture_output=True, text=True, timeout=120, check=True)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"scp download failed (exit {result.returncode}): "
+                + (result.stderr or result.stdout or "unknown").strip()
+            )
 
     # ------------------------------------------------------------------
     # Config
@@ -161,53 +176,82 @@ class RemoteAdapter(BaseODNNAdapter):
     def start_training(self, config: Dict[str, Any], mat_file: str = "") -> str:
         """Upload config & data, auto-select GPU, launch training on server.
 
+        Writes a *launcher script* to the server so that the slow ``conda
+        activate`` happens inside a background process.  The SSH call returns
+        in under 10 seconds regardless of conda startup time.
+
         Returns a ``job_id`` string: ``"user@host:run_id:remote_pid"``.
         """
+        import base64
+
         # 1. Generate unique run_id ------------------------------------------
         run_id = time.strftime("run_%Y%m%d_%H%M%S")
         self._current_run_id = run_id
         run_dir = f"{self.workspace_dir}/runs/{run_id}"
 
-        # 2. Create run directory on server ----------------------------------
-        self._ssh(f"mkdir -p {run_dir}/{{logs,checkpoints}}")
-
-        # 3. Handle .mat file ------------------------------------------------
+        # 2. Handle .mat file (one scp if local) -----------------------------
         remote_mat_path: str
         if mat_file and Path(mat_file).exists():
-            # local file -> upload once, then reuse
             mat_name = Path(mat_file).name
-            self._ssh(f"mkdir -p {self._remote_upload_dir}")
             self._scp_upload(mat_file, f"{self._remote_upload_dir}/{mat_name}")
             remote_mat_path = f"{self._remote_upload_dir}/{mat_name}"
         else:
-            # assume already on the server at the given path
             remote_mat_path = mat_file
 
-        # 4. Upload config JSON ----------------------------------------------
-        local_tmp = Path.home() / ".odnn" / f"train_config_{run_id}.json"
-        local_tmp.parent.mkdir(parents=True, exist_ok=True)
-        local_tmp.write_text(json.dumps(config, indent=2))
-        self._scp_upload(str(local_tmp), f"{run_dir}/train_config.json")
-        local_tmp.unlink(missing_ok=True)
-
-        # 5. Auto-select GPU (most free memory) ------------------------------
+        # 3. Pick best GPU (separate SSH call, quick) ------------------------
         gpu_id = self._pick_best_gpu()
 
-        # 6. Launch training (conda activation required!) --------------------
-        launch_cmd = (
-            f"source ~/miniconda3/etc/profile.d/conda.sh && "
-            f"conda activate {self.conda_env} && "
-            f"cd {self.project_dir} && "
+        # 4. Build config + launcher script (both base64) --------------------
+        config_json = json.dumps(config, indent=2)
+        config_b64 = base64.b64encode(config_json.encode()).decode()
+
+        # The launcher script does the slow conda activation *inside* the
+        # background process, so the SSH call returns immediately.
+        launcher_script = (
+            f"#!/bin/bash\n"
+            f"set -e\n"
+            f"source $HOME/miniconda3/etc/profile.d/conda.sh\n"
+            f"conda activate {self.conda_env}\n"
+            f"cd {self.project_dir}\n"
             f"CUDA_VISIBLE_DEVICES={gpu_id} "
-            f"nohup python mainfor6_wl.py "
+            f"python mainfor6_wl.py "
             f"  --config {run_dir}/train_config.json "
             f"  --mat_file {remote_mat_path} "
-            f"  --output_dir {run_dir} "
-            f"  > {run_dir}/logs/training_wl.log 2>&1 & "
+            f"  --output_dir {run_dir}\n"
+        )
+        script_b64 = base64.b64encode(launcher_script.encode()).decode()
+
+        # 5. Single SSH call: mkdir + write files + launch (returns fast) ----
+        launch_cmd = (
+            f"mkdir -p {self._remote_upload_dir} {run_dir}/{{logs,checkpoints}} && "
+            f"echo '{config_b64}' | base64 -d > {run_dir}/train_config.json && "
+            f"echo '{script_b64}' | base64 -d > {run_dir}/launch.sh ; "
+            f"nohup bash {run_dir}/launch.sh > {run_dir}/logs/training_wl.log 2>&1 < /dev/null & "
             f"echo $!"
         )
-        result = self._ssh(launch_cmd, timeout=15)
+        # Cmd line length, so we use Python to pipe to SSH
+        result = subprocess.run(
+            [
+                "ssh",
+                "-p", str(self.port),
+                "-o", "ConnectTimeout=10",
+                "-o", "StrictHostKeyChecking=accept-new",
+                "-o", "BatchMode=yes",
+                self.ssh_target,
+                launch_cmd,
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(
+                f"SSH launch failed (exit {result.returncode}): "
+                + (result.stderr or result.stdout or "unknown").strip()
+            )
         remote_pid = result.stdout.strip()
+        if not remote_pid.isdigit():
+            raise RuntimeError(
+                f"Failed to get PID from launch. stdout={result.stdout!r} stderr={result.stderr!r}"
+            )
 
         return f"{self.ssh_target}:{run_id}:{remote_pid}"
 
@@ -248,16 +292,16 @@ class RemoteAdapter(BaseODNNAdapter):
         return result.stdout.splitlines()
 
     def fetch_metrics_jsonl(self) -> str:
-        """Fetch the current run's metrics JSONL from the server.
+        """Fetch the current run's full metrics JSONL from the server.
 
-        Uses ``tail -n`` (not ``cat``) to avoid transferring the entire file
-        on every poll cycle.
+        Metrics files are small (<200 KB even for 600 epochs); fetching the
+        whole file guarantees all layers are included in the chart data.
         """
         if not self._current_run_id:
             return ""
         run_dir = f"{self.workspace_dir}/runs/{self._current_run_id}"
         result = self._ssh_no_check(
-            f"tail -n 200 {run_dir}/logs/metrics_wl.jsonl 2>/dev/null || true"
+            f"cat {run_dir}/logs/metrics_wl.jsonl 2>/dev/null || true"
         )
         return result.stdout
 
@@ -280,7 +324,7 @@ class RemoteAdapter(BaseODNNAdapter):
             f"print(json.dumps(dict(c.get('meta', {{}}))))"
         )
         result = self._ssh_no_check(
-            f"source ~/miniconda3/etc/profile.d/conda.sh && "
+            f"source $HOME/miniconda3/etc/profile.d/conda.sh && "
             f"conda activate {self.conda_env} && "
             f"python -c '{py_script}'"
         )
@@ -346,19 +390,20 @@ class RemoteAdapter(BaseODNNAdapter):
         gpus: List[Dict[str, Any]] = []
         for line in result.stdout.strip().split("\n"):
             parts = [p.strip() for p in line.split(",")]
-            if len(parts) < 6:
+            if len(parts) < 7:
                 continue
             try:
                 mem_used = int(parts[3].replace(" MiB", "").replace(" GiB", ""))
                 mem_total = int(parts[4].replace(" MiB", "").replace(" GiB", ""))
-                mem_free = int(parts[5].replace(" MiB", "").replace(" GiB", ""))
+                temp_gpu = int(parts[5].replace(" C", "").replace("C", ""))
+                mem_free = int(parts[6].replace(" MiB", "").replace(" GiB", ""))
                 gpus.append({
                     "index": int(parts[0]),
                     "name": parts[1],
                     "utilization_gpu": int(parts[2].replace(" %", "").replace("%", "")),
                     "memory_used_mib": mem_used,
                     "memory_total_mib": mem_total,
-                    "temperature_gpu": int(parts[4].replace(" C", "").replace("C", "")) if len(parts) > 4 else 0,
+                    "temperature_gpu": temp_gpu,
                     "memory_free_mib": mem_free,
                 })
             except (ValueError, IndexError):
@@ -391,7 +436,10 @@ class RemoteAdapter(BaseODNNAdapter):
         """Return the index of the GPU with the most free memory."""
         gpus = self.get_gpu_status()
         if not gpus:
-            return 0  # fallback to GPU 0
+            raise RuntimeError(
+                "Cannot query GPU status from server. "
+                "Check that the SSH connection is working."
+            )
         best = max(gpus, key=lambda g: g.get("memory_free_mib", 0))
         return best["index"]
 

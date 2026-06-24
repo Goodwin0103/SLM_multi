@@ -368,8 +368,8 @@ def _section_param_config() -> None:
                     fig.tight_layout()
                     st.pyplot(fig)
                     plt.close(fig)
-            except Exception:
-                st.caption("(mode preview unavailable)")
+            except Exception as exc:
+                st.caption(f"(mode preview unavailable: {exc})")
 
 
 # ---------------------------------------------------------------------------
@@ -463,36 +463,46 @@ def _section_training() -> None:
     is_remote   = st.session_state.wl_compute_mode == "Remote"
     job_id      = st.session_state.wl_remote_job_id if is_remote else None
 
-    # -- liveness check ----------------------------------------------------
+    # -- liveness + metrics polling ----------------------------------------
     if st.session_state.is_training:
-        alive = False
-        if is_remote and job_id and adapter:
-            try:
-                alive = adapter.is_training_alive(job_id)
-            except Exception:
-                alive = False
-        elif not is_remote and st.session_state.training_pid:
-            alive = adapter.is_training_alive(st.session_state.training_pid)
-
-        if not alive:
-            st.session_state.is_training = False
-            if is_remote:
-                st.session_state.wl_remote_job_id = None
-            else:
-                st.session_state.training_pid = None
-
-    if st.session_state.is_training:
-        refresh_interval = 5000 if is_remote else 1000
+        refresh_interval = 3000 if is_remote else 1000
         st_autorefresh(interval=refresh_interval, key="wl_training_monitor")
 
-        # remote: fetch metrics from server and cache locally
+        # track cycle count for less frequent liveness checks
+        cycle = st.session_state.get("wl_poll_cycle", 0) + 1
+        st.session_state.wl_poll_cycle = cycle
+
+        # remote: fetch metrics first (it's the primary signal of life)
+        metrics_updated = False
         if is_remote and adapter and job_id:
             try:
                 raw = adapter.fetch_metrics_jsonl()
                 if raw.strip():
                     REMOTE_METRICS_PATH.write_text(raw)
+                    metrics_updated = True
             except Exception:
                 pass
+
+        # Only check liveness every 5 cycles (15s) or when metrics are stale,
+        # to reduce SSH call frequency and avoid connection-refused storms.
+        need_liveness = (cycle % 5 == 0) or (not metrics_updated and cycle > 2)
+        if need_liveness:
+            alive = False
+            if is_remote and job_id and adapter:
+                try:
+                    alive = adapter.is_training_alive(job_id)
+                except Exception:
+                    # SSH temp failure → assume alive, retry next cycle
+                    alive = True
+            elif not is_remote and st.session_state.training_pid:
+                alive = adapter.is_training_alive(st.session_state.training_pid)
+
+            if not alive:
+                st.session_state.is_training = False
+                if is_remote:
+                    st.session_state.wl_remote_job_id = None
+                else:
+                    st.session_state.training_pid = None
 
     col_start, col_stop = st.columns([1, 1])
     with col_start:
@@ -501,6 +511,16 @@ def _section_training() -> None:
             or (st.session_state.mat_file_path is None)
             or (is_remote and adapter is None)
         )
+        # debug: show why button is disabled
+        reasons = []
+        if st.session_state.is_training:
+            reasons.append("already training")
+        if st.session_state.mat_file_path is None:
+            reasons.append("no .mat file loaded")
+        if is_remote and adapter is None:
+            reasons.append("remote adapter not configured")
+        if reasons:
+            st.caption("Start disabled: " + ", ".join(reasons))
         if st.button("Start", type="primary", disabled=disabled_start):
             _do_start_training()
             st.rerun()
@@ -588,11 +608,10 @@ _init_state()
 
 st.title("Multi-WL Training")
 
-compute_mode = st.segmented_control(
+st.segmented_control(
     "Compute", options=["Local", "Remote"],
     key="wl_compute_mode",
 )
-st.session_state.wl_compute_mode = compute_mode
 
 st.divider()
 

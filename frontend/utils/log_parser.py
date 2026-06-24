@@ -4,13 +4,10 @@ from typing import List
 
 import pandas as pd
 
-MAX_DISPLAY_POINTS = 1000
-
-# how far from the end of the file to search for the last valid JSON line
 _TAIL_CHUNK_BYTES = 4096
 
 
-def parse_metrics_jsonl(log_path: Path, max_points: int = MAX_DISPLAY_POINTS) -> pd.DataFrame:
+def parse_metrics_jsonl(log_path: Path) -> pd.DataFrame:
     """Read a JSONL metrics file and return a DataFrame.
 
     Each line is expected to be a JSON object with at least 'epoch' and 'loss'.
@@ -36,8 +33,7 @@ def parse_metrics_jsonl(log_path: Path, max_points: int = MAX_DISPLAY_POINTS) ->
     if not records:
         return pd.DataFrame()
 
-    df = pd.DataFrame(records)
-    return df.tail(max_points).reset_index(drop=True)
+    return pd.DataFrame(records)
 
 
 def latest_metrics(log_path: Path) -> dict:

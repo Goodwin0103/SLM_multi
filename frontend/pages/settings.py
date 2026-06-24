@@ -99,7 +99,7 @@ def render() -> None:
     with col_a:
         cfg["project_dir"] = st.text_input(
             "Project directory (code)",
-            value=cfg.get("project_dir", f"/home/{cfg.get('user', getpass.getuser())}/odnn_project"),
+            value=cfg.get("project_dir", f"/home/{cfg.get('user', getpass.getuser())}/ODNN"),
             help="Absolute path to the cloned ODNN repo on the server.",
         )
     with col_b:

@@ -85,51 +85,22 @@ def _init_session_state(adapter: Mainfor6WLAdapter) -> None:
 def _render_model_section(adapter: Mainfor6WLAdapter) -> None:
     st.subheader("1. Model & Data")
 
-    # -- checkpoint selector -----------------------------------------------
-    ckpt_paths = adapter.list_checkpoints()
-    if not ckpt_paths:
-        st.info("No .pth files auto-detected. Paste a path below or train a model first.")
-        st.session_state.wl_selected_ckpt = None
-        st.session_state.wl_ckpt_meta = {}
-    else:
-        ckpt_names = [str(Path(p).relative_to(_PROJECT_ROOT)) for p in ckpt_paths]
-        current_rel = (
-            str(Path(st.session_state.wl_selected_ckpt).relative_to(_PROJECT_ROOT))
-            if st.session_state.wl_selected_ckpt
-            else None
-        )
-        default_idx = ckpt_names.index(current_rel) if current_rel in ckpt_names else 0
+    # -- checkpoint source toggle -------------------------------------------
+    if "wl_ckpt_source" not in st.session_state:
+        st.session_state.wl_ckpt_source = "Local"
 
-        chosen_name = st.selectbox("Checkpoint", ckpt_names, index=default_idx)
-        chosen_path = ckpt_paths[ckpt_names.index(chosen_name)]
-
-        if chosen_path != st.session_state.wl_selected_ckpt:
-            st.session_state.wl_selected_ckpt = chosen_path
-            st.session_state.wl_ckpt_meta = adapter.load_checkpoint_meta(chosen_path)
-            st.session_state.wl_test_result = None
-
-    # manual path fallback
-    manual_ckpt = st.text_input(
-        "Or enter checkpoint path manually",
-        placeholder="/path/to/checkpoint.pth",
+    st.segmented_control(
+        "Checkpoint source", options=["Local", "Remote"],
+        key="wl_ckpt_source",
     )
-    if manual_ckpt:
-        mp = Path(manual_ckpt.strip())
-        if mp.exists() and mp.suffix == ".pth":
-            if str(mp) != st.session_state.wl_selected_ckpt:
-                st.session_state.wl_selected_ckpt = str(mp)
-                st.session_state.wl_ckpt_meta = adapter.load_checkpoint_meta(str(mp))
-                st.session_state.wl_test_result = None
-                st.rerun()
-        elif mp.suffix != ".pth":
-            st.caption("Must be a .pth file.")
-        else:
-            st.caption("File not found.")
+    ckpt_source = st.session_state.wl_ckpt_source
 
-    # -- fetch checkpoint from remote server --------------------------------
-    remote_cfg = load_remote_config()
-    if remote_cfg:
-        with st.expander("Fetch from Server", expanded=False):
+    # -- Remote checkpoint selector ------------------------------------------
+    if ckpt_source == "Remote":
+        remote_cfg = load_remote_config()
+        if not remote_cfg:
+            st.warning("Remote server not configured. Go to Settings first.")
+        else:
             try:
                 radapter = RemoteAdapter(
                     host=remote_cfg["host"], user=remote_cfg["user"],
@@ -142,21 +113,70 @@ def _render_model_section(adapter: Mainfor6WLAdapter) -> None:
                 if remote_ckpts:
                     ckpt_display = [p.split("/")[-1] + "  (" + p + ")" for p in remote_ckpts]
                     sel_remote = st.selectbox("Server checkpoints", ckpt_display, key="wl_fetch_ckpt")
-                    if st.button("Download selected checkpoint"):
-                        sel_idx = ckpt_display.index(sel_remote)
-                        sel_path = remote_ckpts[sel_idx]
-                        local_dir = _PROJECT_ROOT / "checkpoints"
-                        with st.spinner(f"Downloading from server..."):
-                            local_pth = radapter.download_checkpoint(sel_path, str(local_dir))
-                        st.success(f"Downloaded: {local_pth}")
-                        st.session_state.wl_selected_ckpt = local_pth
-                        st.session_state.wl_ckpt_meta = radapter.load_checkpoint_meta(sel_path)
-                        st.session_state.wl_test_result = None
-                        st.rerun()
+                    col_dl, _ = st.columns([1, 2])
+                    with col_dl:
+                        if st.button("Download & Select", type="primary"):
+                            sel_idx = ckpt_display.index(sel_remote)
+                            sel_path = remote_ckpts[sel_idx]
+                            local_dir = Path.home() / ".odnn" / "checkpoints"
+                            with st.spinner("Downloading from server..."):
+                                local_pth = radapter.download_checkpoint(sel_path, str(local_dir))
+                            # load meta from the freshly downloaded LOCAL file
+                            st.session_state.wl_selected_ckpt = local_pth
+                            st.session_state.wl_ckpt_meta = adapter.load_checkpoint_meta(local_pth)
+                            st.session_state.wl_test_result = None
+                            st.success(f"Downloaded: {local_pth}")
+                            st.rerun()
                 else:
-                    st.caption("No checkpoints found on server.")
+                    st.info("No checkpoints found on server.")
+                # show currently selected remote checkpoint
+                if st.session_state.wl_selected_ckpt:
+                    st.caption(f"Selected: {st.session_state.wl_selected_ckpt}")
             except Exception as exc:
-                st.caption(f"Could not connect: {exc}")
+                st.caption(f"Could not connect to server: {exc}")
+
+    # -- Local checkpoint selector ------------------------------------------
+    else:
+        ckpt_paths = adapter.list_checkpoints()
+        # if current checkpoint came from Remote download (outside project),
+        # reset it to avoid relative_to() crash
+        _cur = st.session_state.wl_selected_ckpt
+        if _cur and not str(Path(_cur).resolve()).startswith(str(_PROJECT_ROOT.resolve())):
+            _cur = None
+        if not ckpt_paths:
+            st.info("No .pth files auto-detected. Paste a path below or train a model first.")
+            st.session_state.wl_selected_ckpt = None
+            st.session_state.wl_ckpt_meta = {}
+        else:
+            ckpt_names = [str(Path(p).relative_to(_PROJECT_ROOT)) for p in ckpt_paths]
+            current_rel = str(Path(_cur).relative_to(_PROJECT_ROOT)) if _cur else None
+            default_idx = ckpt_names.index(current_rel) if current_rel in ckpt_names else 0
+
+            chosen_name = st.selectbox("Checkpoint", ckpt_names, index=default_idx)
+            chosen_path = ckpt_paths[ckpt_names.index(chosen_name)]
+
+            if chosen_path != st.session_state.wl_selected_ckpt:
+                st.session_state.wl_selected_ckpt = chosen_path
+                st.session_state.wl_ckpt_meta = adapter.load_checkpoint_meta(chosen_path)
+                st.session_state.wl_test_result = None
+
+        # manual path fallback
+        manual_ckpt = st.text_input(
+            "Or enter checkpoint path manually",
+            placeholder="/path/to/checkpoint.pth",
+        )
+        if manual_ckpt:
+            mp = Path(manual_ckpt.strip())
+            if mp.exists() and mp.suffix == ".pth":
+                if str(mp) != st.session_state.wl_selected_ckpt:
+                    st.session_state.wl_selected_ckpt = str(mp)
+                    st.session_state.wl_ckpt_meta = adapter.load_checkpoint_meta(str(mp))
+                    st.session_state.wl_test_result = None
+                    st.rerun()
+            elif mp.suffix != ".pth":
+                st.caption("Must be a .pth file.")
+            else:
+                st.caption("File not found.")
 
     # -- model info --------------------------------------------------------
     meta = st.session_state.wl_ckpt_meta

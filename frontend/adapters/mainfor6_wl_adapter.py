@@ -278,7 +278,24 @@ class Mainfor6WLAdapter(BaseODNNAdapter):
             out_size=out_size,
             padding_ratio_out=padding_ratio_out,
         )
-        model.load_state_dict(ckpt["state_dict"])
+
+        # Convert old-format checkpoint (single-WL → multi-WL) if needed.
+        # Old checkpoints have 2D kz tensors [H, W]; new ones are 3D [L, H, W].
+        state = ckpt["state_dict"]
+        _sample_kz = state.get("pre_propagation.kz_base")
+        if _sample_kz is not None and _sample_kz.dim() == 2:
+            for _pfx in ("pre_propagation", "propagation"):
+                for _suffix in ("kz_base", "kz_pad"):
+                    _k = f"{_pfx}.{_suffix}"
+                    if _k in state and state[_k].dim() == 2:
+                        state[_k] = state[_k].unsqueeze(0).repeat(L, 1, 1)
+            for _li in range(num_layers):
+                for _suffix in ("kz_base", "kz_pad"):
+                    _k = f"layers.{_li}.{_suffix}"
+                    if _k in state and state[_k].dim() == 2:
+                        state[_k] = state[_k].unsqueeze(0).repeat(L, 1, 1)
+
+        model.load_state_dict(state, strict=False)
         model.eval()
 
         # -- load & normalise eigenmodes ---------------------------------
@@ -511,6 +528,7 @@ class Mainfor6WLAdapter(BaseODNNAdapter):
         ef = eigenmode_field.to(device=device, dtype=torch.complex64)
         while ef.ndim > 2:
             ef = ef.squeeze(0)
+        padded = pad_field_to_layer(ef, layer_size)
         field = padded[None, None, ...].repeat(1, L, 1, 1).contiguous()  # (1, L, H, W)
         H, W = int(field.shape[-2]), int(field.shape[-1])
 
