@@ -78,21 +78,33 @@ def _load_mode_preview(
     mmf = modes[:, :, :M].transpose(2, 0, 1)  # (M, H, W)
     input_amp = np.abs(mmf)
 
-    # build multi-wavelength label patterns
+    # build multi-wavelength label patterns (banded per wavelength)
     L = len(wavelengths_nm)
     H, W = layer_size, layer_size
 
+    inner_margin = circle_radius + 3
+    total_per_wl = M
     mx = max(int(W * margin_ratio), circle_radius + 5)
     my = max(int(H * margin_ratio), circle_radius + 5)
-    xs = np.linspace(mx, W - 1 - mx, L)
-    ys = np.linspace(my, H - 1 - my, M)
+    avail_y = H - 2 * my
+    band_h = avail_y / max(L, 1)
+    band_w = W - 2 * mx
+    ncols = max(1, min(total_per_wl, int(np.ceil(np.sqrt(total_per_wl * band_w / max(band_h, 1))))))
+    nrows = int(np.ceil(total_per_wl / ncols))
 
-    patterns = np.zeros((H, W, M * L), dtype=np.float32)
+    total = M * L
+    patterns = np.zeros((H, W, total), dtype=np.float32)
     for mode_idx in range(M):
         for wl_idx in range(L):
             idx = mode_idx * L + wl_idx
-            cx = int(round(xs[wl_idx]))
-            cy = int(round(ys[mode_idx]))
+            band_y0 = my + wl_idx * band_h
+            band_y1 = my + (wl_idx + 1) * band_h
+            row = mode_idx // ncols
+            col = mode_idx % ncols
+            xs_arr = np.linspace(mx, W - 1 - mx, ncols)
+            ys_arr = np.linspace(band_y0 + inner_margin, band_y1 - inner_margin, nrows)
+            cx = int(round(xs_arr[col]))
+            cy = int(round(ys_arr[row]))
             yy, xx = np.ogrid[:H, :W]
             patterns[:, :, idx] = (
                 (yy - cy) ** 2 + (xx - cx) ** 2 <= circle_radius ** 2

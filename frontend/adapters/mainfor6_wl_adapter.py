@@ -645,16 +645,27 @@ def _build_evaluation_regions(
     *, H: int, W: int, num_modes: int, num_wavelengths: int, radius: int, margin_ratio: float = 0.2,
 ) -> List[tuple]:
     """Build flat evaluation_regions list: regions[mode * L + wavelength]."""
+    inner_margin = radius + 3
+    total_per_wl = num_modes
     mx = max(int(W * margin_ratio), radius + 5)
     my = max(int(H * margin_ratio), radius + 5)
-    xs = np.linspace(mx, W - 1 - mx, num_wavelengths)
-    ys = np.linspace(my, H - 1 - my, num_modes)
+    avail_y = H - 2 * my
+    band_h = avail_y / max(num_wavelengths, 1)
+    band_w = W - 2 * mx
+    ncols = max(1, min(total_per_wl, int(np.ceil(np.sqrt(total_per_wl * band_w / max(band_h, 1))))))
+    nrows = int(np.ceil(total_per_wl / ncols))
 
     regions = []
     for mode_idx in range(num_modes):
         for wl_idx in range(num_wavelengths):
-            cx = int(round(xs[wl_idx]))
-            cy = int(round(ys[mode_idx]))
+            band_y0 = my + wl_idx * band_h
+            band_y1 = my + (wl_idx + 1) * band_h
+            row = mode_idx // ncols
+            col = mode_idx % ncols
+            xs_arr = np.linspace(mx, W - 1 - mx, ncols)
+            ys_arr = np.linspace(band_y0 + inner_margin, band_y1 - inner_margin, nrows)
+            cx = int(round(xs_arr[col]))
+            cy = int(round(ys_arr[row]))
             x0 = max(0, cx - radius)
             x1 = min(W, cx + radius)
             y0 = max(0, cy - radius)
@@ -668,10 +679,16 @@ def _build_label_patterns(
 ) -> tuple:
     """Return (patterns_np, regions) matching generate_detector_patterns_multiwl output."""
 
+    inner_margin = radius + 3
+    total_per_wl = num_modes
+    band_w = W - 2 * mx
+    ncols = max(1, min(total_per_wl, int(np.ceil(np.sqrt(total_per_wl * band_w / max(band_h, 1))))))
+    nrows = int(np.ceil(total_per_wl / ncols))
+
     mx = max(int(W * margin_ratio), radius + 5)
     my = max(int(H * margin_ratio), radius + 5)
-    xs = np.linspace(mx, W - 1 - mx, num_wavelengths)
-    ys = np.linspace(my, H - 1 - my, num_modes)
+    avail_y = H - 2 * my
+    band_h = avail_y / max(num_wavelengths, 1)
 
     total = num_modes * num_wavelengths
     patterns = np.zeros((H, W, total), dtype=np.float32)
@@ -679,8 +696,14 @@ def _build_label_patterns(
     idx = 0
     for mode_idx in range(num_modes):
         for wl_idx in range(num_wavelengths):
-            cx = int(round(xs[wl_idx]))
-            cy = int(round(ys[mode_idx]))
+            band_y0 = my + wl_idx * band_h
+            band_y1 = my + (wl_idx + 1) * band_h
+            row = mode_idx // ncols
+            col = mode_idx % ncols
+            xs_arr = np.linspace(mx, W - 1 - mx, ncols)
+            ys_arr = np.linspace(band_y0 + inner_margin, band_y1 - inner_margin, nrows)
+            cx = int(round(xs_arr[col]))
+            cy = int(round(ys_arr[row]))
             yy, xx = np.ogrid[:H, :W]
             patterns[:, :, idx] = (
                 (yy - cy) ** 2 + (xx - cx) ** 2 <= radius ** 2

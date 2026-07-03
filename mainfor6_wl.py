@@ -236,23 +236,32 @@ def generate_detector_patterns_multiwl(
     margin_ratio: float = 0.2,
 ) -> tuple[np.ndarray, list[tuple[int, int, int, int]]]:
     total_labels = num_modes * num_wavelengths
-    num_rows = num_modes
-    num_cols = num_wavelengths
-
     margin_x = int(W * margin_ratio)
     margin_y = int(H * margin_ratio)
     min_margin = radius + 5
     margin_x = max(margin_x, min_margin)
     margin_y = max(margin_y, min_margin)
 
-    xs = np.linspace(margin_x, W - 1 - margin_x, num_cols)
-    ys = np.linspace(margin_y, H - 1 - margin_y, num_rows)
+    # Within each wavelength band, lay out modes in a grid
+    inner_margin = radius + 3
+    total_per_wl = num_modes
+    avail_y = H - 2 * margin_y
+    band_h = avail_y / max(num_wavelengths, 1)
+    band_w = W - 2 * margin_x
+    ncols = max(1, min(total_per_wl, int(np.ceil(np.sqrt(total_per_wl * band_w / max(band_h, 1))))))
+    nrows = int(np.ceil(total_per_wl / ncols))
 
     centers = []
-    for mode_idx in range(num_rows):
-        for wl_idx in range(num_cols):
-            cx = int(round(xs[wl_idx]))
-            cy = int(round(ys[mode_idx]))
+    for mode_idx in range(num_modes):
+        for wl_idx in range(num_wavelengths):
+            band_y0 = margin_y + wl_idx * band_h
+            band_y1 = margin_y + (wl_idx + 1) * band_h
+            row = mode_idx // ncols
+            col = mode_idx % ncols
+            xs_arr = np.linspace(margin_x, W - 1 - margin_x, ncols)
+            ys_arr = np.linspace(band_y0 + inner_margin, band_y1 - inner_margin, nrows)
+            cx = int(round(xs_arr[col]))
+            cy = int(round(ys_arr[row]))
             centers.append((cy, cx))
 
     if pattern_mode == "circle":
@@ -966,6 +975,22 @@ for num_layer in num_layer_option:
         f"WL Iso={comp_metrics['wavelength_isolation_db_mean']:.2f} dB, "
         f"IL={comp_metrics['insertion_loss_db_mean']:.2f} dB"
     )
+
+    # 每层追加写一行JSON，供 batch_train_wl.py 收集
+    try:
+        _summary_log = RUN_ROOT / "logs" / "summary_metrics_wl.jsonl"
+        _summary_log.parent.mkdir(parents=True, exist_ok=True)
+        with open(_summary_log, "a") as _sf:
+            _sf.write(json.dumps({
+                "num_modes": int(num_modes),
+                "num_layers": int(num_layer),
+                "snr_db_mean": float(comp_metrics["snr_db_mean"]),
+                "mode_isolation_db_mean": float(comp_metrics["mode_isolation_db_mean"]),
+                "target_all_roi_ratio_mean": float(comp_metrics["target_all_roi_ratio_mean"]),
+                "throughput_mean": float(np.mean(comp_metrics["throughput_per_mode"])),
+            }) + "\n")
+    except Exception as _e:
+        print(f"WARN: write summary_metrics_wl.jsonl failed: {_e}")
 
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
