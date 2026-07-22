@@ -256,6 +256,7 @@ class Mainfor6WLAdapter(BaseODNNAdapter):
         circle_detectsize   = int(config.get("circle_detectsize", 10))
         circle_focus_radius = int(_m("circle_focus_radius", 5))
         margin_ratio_eval   = float(_m("margin_ratio", 0.2))
+        label_config        = meta.get("label_config", None)  # from Dataset & Label Designer
         z_step_um           = float(config.get("z_step_um", 20.0))
         mode_index          = int(config.get("mode_index", 0))
         super_samples       = int(config.get("num_superposition_eval_samples", 1000))
@@ -299,7 +300,7 @@ class Mainfor6WLAdapter(BaseODNNAdapter):
         model.eval()
 
         # -- load & normalise eigenmodes ---------------------------------
-        eigenmodes_raw = load_complex_modes_from_mat(mat_file, key="modes_field")
+        eigenmodes_raw, _ = load_complex_modes_from_mat(mat_file, key="modes_field")
         field_size = int(eigenmodes_raw.shape[0])
         max_modes_mat = int(eigenmodes_raw.shape[2])
         if max_modes_mat < num_modes_valid:
@@ -314,11 +315,26 @@ class Mainfor6WLAdapter(BaseODNNAdapter):
         mmf_ts = torch.from_numpy(mmf_np.astype(np.complex64))
 
         # -- generate evaluation regions (on out_size canvas) ------------
-        eval_regions = _build_evaluation_regions(
-            H=out_size, W=out_size,
-            num_modes=num_modes_valid, num_wavelengths=L,
-            radius=circle_focus_radius, margin_ratio=margin_ratio_eval,
-        )
+        if label_config:
+            from label_designer import generate_labels
+            label_config_eval = dict(label_config)
+            label_config_eval.update({
+                "focus_size": circle_focus_radius,
+                "radius_per_wl": [circle_focus_radius] * L,
+                "margin_ratio": margin_ratio_eval,
+            })
+            _, eval_regions, _ = generate_labels(
+                out_size=out_size, num_modes=num_modes_valid, num_wavelengths=L,
+                label_config=label_config_eval,
+                modes_field=None,
+                mode_info=None,
+            )
+        else:
+            eval_regions = _build_evaluation_regions(
+                H=out_size, W=out_size,
+                num_modes=num_modes_valid, num_wavelengths=L,
+                radius=circle_focus_radius, margin_ratio=margin_ratio_eval,
+            )
 
         # -- build test dataset ------------------------------------------
         if phase_option == 4:
@@ -354,11 +370,26 @@ class Mainfor6WLAdapter(BaseODNNAdapter):
         image_tensor = torch.stack(images_prepared, dim=0)
 
         # Build per-wavelength label patterns for label_field (on out_size canvas)
-        label_patterns_np, _ = _build_label_patterns(
-            H=out_size, W=out_size,
-            num_modes=num_modes_valid, num_wavelengths=L,
-            radius=circle_focus_radius, margin_ratio=margin_ratio_eval,
-        )
+        if label_config:
+            from label_designer import generate_labels
+            label_config_ovl = dict(label_config)
+            label_config_ovl.update({
+                "focus_size": circle_focus_radius,
+                "radius_per_wl": [circle_focus_radius] * L,
+                "margin_ratio": margin_ratio_eval,
+            })
+            label_patterns_np, _, _ = generate_labels(
+                out_size=out_size, num_modes=num_modes_valid, num_wavelengths=L,
+                label_config=label_config_ovl,
+                modes_field=eigenmodes_raw if label_config.get("label_shape") in ("eigenmode",) else None,
+                mode_info=None,
+            )
+        else:
+            label_patterns_np, _ = _build_label_patterns(
+                H=out_size, W=out_size,
+                num_modes=num_modes_valid, num_wavelengths=L,
+                radius=circle_focus_radius, margin_ratio=margin_ratio_eval,
+            )
 
         # -- comprehensive metrics ---------------------------------------
         metrics_result = evaluate_multiwl_comprehensive_metrics(
@@ -681,14 +712,13 @@ def _build_label_patterns(
 
     inner_margin = radius + 3
     total_per_wl = num_modes
-    band_w = W - 2 * mx
-    ncols = max(1, min(total_per_wl, int(np.ceil(np.sqrt(total_per_wl * band_w / max(band_h, 1))))))
-    nrows = int(np.ceil(total_per_wl / ncols))
-
     mx = max(int(W * margin_ratio), radius + 5)
     my = max(int(H * margin_ratio), radius + 5)
     avail_y = H - 2 * my
     band_h = avail_y / max(num_wavelengths, 1)
+    band_w = W - 2 * mx
+    ncols = max(1, min(total_per_wl, int(np.ceil(np.sqrt(total_per_wl * band_w / max(band_h, 1))))))
+    nrows = int(np.ceil(total_per_wl / ncols))
 
     total = num_modes * num_wavelengths
     patterns = np.zeros((H, W, total), dtype=np.float32)

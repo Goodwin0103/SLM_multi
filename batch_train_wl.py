@@ -40,7 +40,7 @@ OUTPUT_DIR = "results/batch_sweep"              # 所有输出的根目录
 # 固定的基础训练参数（键名与 mainfor6_wl.py 的 --config 一致）
 BASE_CONFIG: Dict = {
     "num_layers_list": [1, 2, 3, 4, 5],   # 每次训练内部循环的层数
-    "field_size": 100,                    # 须匹配 MAT_FILE 的空间尺寸
+    "field_size": 50,                     # 须匹配 MAT_FILE 的空间尺寸
     "layer_size": 110,
     "out_size": 600,
     "padding_ratio_out": 0.5,
@@ -56,12 +56,20 @@ BASE_CONFIG: Dict = {
     "epochs": 1000,
     "lr": 1.99,
     "batch_size": 16,
-    "circle_focus_radius": 5,
+    "circle_focus_radius": 10,
+    "circle_detectsize": 20,
     "margin_ratio": 0.2,
     "phase_option": 4,
     "evaluation_mode": "eigenmode",
     "training_dataset_mode": "eigenmode",
-    "label_pattern_mode": "circle",
+    # label_designer config (band-per-wavelength layout)
+    "label_config": {
+        "label_type": "modes",
+        "label_shape": "circle",
+        "focus_size": 10,
+        "margin_ratio": 0.2,
+        "circle_detectsize": 20,
+    },
 }
 
 # 四个要画的指标：(summary jsonl 里的键, 文件名, 纵轴标题)

@@ -35,11 +35,10 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 _PARAM_FIELDS = [
-    "layer_size", "out_size", "num_modes", "batch_size", "epochs",
-    "learning_rate", "lr_gamma", "base_wavelength_idx",
+    "layer_size", "num_modes", "batch_size", "epochs",
+    "learning_rate", "lr_gamma",
     "z_layers_um", "z_prop_um", "z_input_to_first_um", "pixel_size_um",
-    "circle_focus_radius", "margin_ratio",
-    "wl_start_nm", "wl_spacing_nm", "wl_count", "padding_ratio_out",
+    "padding_ratio_out",
 ]
 
 
@@ -52,71 +51,6 @@ def _parse_int_list(text: str) -> list[int]:
         except ValueError:
             continue
     return result
-
-
-# ---------------------------------------------------------------------------
-# Mode preview (cached)
-# ---------------------------------------------------------------------------
-
-@st.cache_data(show_spinner="Loading mode preview...")
-def _load_mode_preview(
-    mat_path: str,
-    layer_size: int,
-    num_modes: int,
-    wavelengths_nm: list,
-    circle_radius: int = 5,
-    margin_ratio: float = 0.1,
-):
-    """Return input amplitudes + label patterns for ALL modes (0..num_modes-1)."""
-    from odnn_io import load_complex_modes_from_mat
-
-    modes = load_complex_modes_from_mat(mat_path, key="modes_field")
-    field_size = int(modes.shape[0])
-    total_modes = int(modes.shape[2])
-    M = min(num_modes, total_modes)
-
-    mmf = modes[:, :, :M].transpose(2, 0, 1)  # (M, H, W)
-    input_amp = np.abs(mmf)
-
-    # build multi-wavelength label patterns (banded per wavelength)
-    L = len(wavelengths_nm)
-    H, W = layer_size, layer_size
-
-    inner_margin = circle_radius + 3
-    total_per_wl = M
-    mx = max(int(W * margin_ratio), circle_radius + 5)
-    my = max(int(H * margin_ratio), circle_radius + 5)
-    avail_y = H - 2 * my
-    band_h = avail_y / max(L, 1)
-    band_w = W - 2 * mx
-    ncols = max(1, min(total_per_wl, int(np.ceil(np.sqrt(total_per_wl * band_w / max(band_h, 1))))))
-    nrows = int(np.ceil(total_per_wl / ncols))
-
-    total = M * L
-    patterns = np.zeros((H, W, total), dtype=np.float32)
-    for mode_idx in range(M):
-        for wl_idx in range(L):
-            idx = mode_idx * L + wl_idx
-            band_y0 = my + wl_idx * band_h
-            band_y1 = my + (wl_idx + 1) * band_h
-            row = mode_idx // ncols
-            col = mode_idx % ncols
-            xs_arr = np.linspace(mx, W - 1 - mx, ncols)
-            ys_arr = np.linspace(band_y0 + inner_margin, band_y1 - inner_margin, nrows)
-            cx = int(round(xs_arr[col]))
-            cy = int(round(ys_arr[row]))
-            yy, xx = np.ogrid[:H, :W]
-            patterns[:, :, idx] = (
-                (yy - cy) ** 2 + (xx - cx) ** 2 <= circle_radius ** 2
-            ).astype(np.float32)
-
-    labels = np.zeros((M, H, W), dtype=np.float32)
-    for mode_idx in range(M):
-        wl_indices = [mode_idx * L + wl for wl in range(L)]
-        wl_patterns = patterns[:, :, wl_indices]  # (H, W, L)
-        labels[mode_idx] = wl_patterns.sum(axis=2)  # sum over all wavelengths
-
-    return input_amp, labels, field_size, total_modes
 
 
 # ---------------------------------------------------------------------------
@@ -145,11 +79,16 @@ def _init_state() -> None:
     if "training_error" not in st.session_state:
         st.session_state.training_error = None
 
-    if "wl_train_config" not in st.session_state:
+    # Reload config from disk whenever the file changed (designer may have saved new values)
+    _config_mtime = CONFIG_PATH.stat().st_mtime if CONFIG_PATH.exists() else 0.0
+    if "wl_config_mtime" not in st.session_state:
+        st.session_state.wl_config_mtime = 0.0
+    if "wl_train_config" not in st.session_state or _config_mtime > st.session_state.wl_config_mtime:
         defaults = st.session_state.wl_adapter.load_default_config()
         mgr = ConfigManager(CONFIG_PATH)
         saved = mgr.load_config()
         st.session_state.wl_train_config = mgr.merge_with_defaults(saved, defaults)
+        st.session_state.wl_config_mtime = _config_mtime
 
     cfg = st.session_state.wl_train_config
     for field in _PARAM_FIELDS:
@@ -186,12 +125,19 @@ def _get_adapter():
 @st.cache_data(show_spinner=False)
 def _load_mat_shape(mat_path: str):
     from odnn_io import load_complex_modes_from_mat
-    arr = load_complex_modes_from_mat(mat_path)
+    arr, _ = load_complex_modes_from_mat(mat_path)
     return arr.shape[0], arr.shape[2]
 
 
 def _section_load_data() -> None:
     st.subheader("1. Load Data")
+
+    # Auto-fill mat_file_path from train_config_wl.json (saved by Designer)
+    if not st.session_state.mat_file_path:
+        saved_mat = st.session_state.wl_train_config.get("mat_file_path")
+        if saved_mat and Path(saved_mat).exists():
+            st.session_state.mat_file_path = saved_mat
+            st.info(f"Using dataset: **{Path(saved_mat).name}**")
 
     uploaded = st.file_uploader("Select .mat mode file", type=["mat"])
 
@@ -199,6 +145,7 @@ def _section_load_data() -> None:
         dest = TEMP_DIR / uploaded.name
         dest.write_bytes(uploaded.getbuffer())
         st.session_state.mat_file_path = str(dest)
+        st.session_state.wl_train_config["mat_file_path"] = str(dest)
 
     if st.session_state.mat_file_path:
         p = Path(st.session_state.mat_file_path)
@@ -225,6 +172,7 @@ def _section_load_data() -> None:
         )
         if manual and Path(manual).exists():
             st.session_state.mat_file_path = manual
+            st.session_state.wl_train_config["mat_file_path"] = manual
             st.rerun()
         elif manual:
             st.warning("File not found at the given path.")
@@ -256,30 +204,12 @@ def _section_param_config() -> None:
 
         st.markdown("**Output**")
         st.number_input(
-            "Output size (px)", 50, 1000, step=10,
-            value=cfg.get("out_size", 600), key="wl_param_out_size",
-        )
-        st.number_input(
             "Padding ratio out", 0.0, 1.0, value=cfg.get("padding_ratio_out", 0.5),
             format="%.2f", step=0.05, key="wl_param_padding_ratio_out",
         )
 
     with col2:
         st.markdown("**Physics**")
-        st.number_input(
-            "Wavelength start (nm)", 400, 2000, step=1,
-            value=cfg.get("wl_start_nm", 1550), key="wl_param_wl_start_nm",
-        )
-        st.number_input(
-            "Wavelength spacing (nm)", 0.1, 100.0, format="%.1f", step=0.5,
-            value=cfg.get("wl_spacing_nm", 0.5), key="wl_param_wl_spacing_nm",
-        )
-        st.number_input(
-            "Wavelength count", 1, 50, step=1,
-            value=cfg.get("wl_count", 2), key="wl_param_wl_count",
-        )
-        st.caption(f"Total: {int(st.session_state.get('wl_param_wl_count', 2))} wavelengths")
-        st.number_input("Base wavelength index", 0, 20, step=1, key="wl_param_base_wavelength_idx")
         st.number_input("Layer separation z (um)",    1,   100000, step=100,  key="wl_param_z_layers_um")
         st.number_input("Output prop. distance (um)", 1,   500000, step=500,  key="wl_param_z_prop_um")
         st.number_input("Input-to-first z (um)",      0,   100000, step=100,  key="wl_param_z_input_to_first_um")
@@ -298,22 +228,10 @@ def _section_param_config() -> None:
 
     with col4:
         st.markdown("**Dataset**")
-        cfg["label_pattern_mode"]    = st.selectbox("Label pattern",    ["circle", "eigenmode"],
-                                                      index=0 if cfg["label_pattern_mode"] == "circle" else 1)
         cfg["training_dataset_mode"] = st.selectbox("Training dataset", ["eigenmode", "superposition"],
                                                       index=0 if cfg["training_dataset_mode"] == "eigenmode" else 1)
         cfg["evaluation_mode"]       = st.selectbox("Evaluation mode",  ["eigenmode", "superposition"],
                                                       index=0 if cfg["evaluation_mode"] == "eigenmode" else 1)
-
-        st.markdown("**Label**")
-        st.number_input(
-            "Focus radius (px)", 1, 50, step=1,
-            value=cfg.get("circle_focus_radius", 5), key="wl_param_circle_focus_radius",
-        )
-        st.number_input(
-            "Margin ratio", 0.05, 0.5, format="%.2f", step=0.05,
-            value=cfg.get("margin_ratio", 0.2), key="wl_param_margin_ratio",
-        )
 
     # sync widget states back into train_config
     for field in _PARAM_FIELDS:
@@ -327,61 +245,22 @@ def _section_param_config() -> None:
     st.session_state.wl_train_config = cfg
 
     if st.button("Save Config", type="secondary"):
-        ConfigManager(CONFIG_PATH).save_config(cfg)
+        # Only persist known keys (strip garbage from old versions / other adapters)
+        _ALL_KNOWN_KEYS = {
+            "layer_size", "out_size", "num_modes", "batch_size", "epochs",
+            "learning_rate", "lr_gamma", "base_wavelength_idx", "phase_option",
+            "z_layers_um", "z_prop_um", "z_input_to_first_um", "pixel_size_um",
+            "circle_focus_radius", "margin_ratio", "circle_detectsize",
+            "wl_start_nm", "wl_spacing_nm", "wl_count", "padding_ratio_out",
+            "padding_ratio", "field_size", "num_layers_list",
+            "training_dataset_mode", "evaluation_mode",
+            "num_superposition_eval_samples", "num_data",
+            "label_config", "mat_file_path", "mat_file_remote_path",
+        }
+        clean = {k: v for k, v in cfg.items() if k in _ALL_KNOWN_KEYS}
+        ConfigManager(CONFIG_PATH).save_config(clean)
+        st.session_state.wl_config_mtime = CONFIG_PATH.stat().st_mtime
         st.success(f"Config saved to {CONFIG_PATH}")
-
-    # --- mode preview (shown when .mat is loaded) ---
-    if st.session_state.mat_file_path and Path(st.session_state.mat_file_path).exists():
-        ls = int(st.session_state.get("wl_param_layer_size", 300))
-        os_val = int(st.session_state.get("wl_param_out_size", ls))
-        nm = int(st.session_state.get("wl_param_num_modes", 10))
-        pix_um = float(st.session_state.get("wl_param_pixel_size_um", 12.5))
-        cr = int(st.session_state.get("wl_param_circle_focus_radius", 5))
-        mr = float(st.session_state.get("wl_param_margin_ratio", 0.2))
-        ws = float(st.session_state.get("wl_param_wl_start_nm", 1550))
-        wd = float(st.session_state.get("wl_param_wl_spacing_nm", 0.5))
-        wc = int(st.session_state.get("wl_param_wl_count", 2))
-        wl_nm = [ws + i * wd for i in range(wc)]
-        max_m = int(st.session_state.get("max_modes", nm))
-        preview_nm = min(nm, max_m)
-
-        if preview_nm > 0:
-            try:
-                amp_all, lbls_all, _fs, _tm = _load_mode_preview(
-                    st.session_state.mat_file_path, os_val, preview_nm, wl_nm,
-                    circle_radius=cr, margin_ratio=mr,
-                )
-                disp_nm = min(preview_nm, _tm)
-                if disp_nm > 0:
-                    st.markdown("---")
-                    st.markdown("**Dataset Preview**")
-                    mode_idx = st.selectbox(
-                        "Mode",
-                        options=list(range(disp_nm)),
-                        format_func=lambda i: f"Mode {i + 1}",
-                        key="wl_preview_mode_idx",
-                    )
-                    fig, (ax_amp, ax_lbl) = plt.subplots(1, 2, figsize=(10, 4.5))
-
-                    im_amp = ax_amp.imshow(amp_all[mode_idx], cmap="inferno",
-                                           extent=[0, _fs * pix_um, _fs * pix_um, 0])
-                    ax_amp.set_title(f"Mode {mode_idx + 1}  Input Amplitude\n"
-                                     f"{_fs}x{_fs} px  |  {pix_um:.1f} um/px"
-                                     f"  |  {_fs * pix_um:.0f} x {_fs * pix_um:.0f} um")
-                    fig.colorbar(im_amp, ax=ax_amp, fraction=0.046, pad=0.04)
-
-                    im_lbl = ax_lbl.imshow(lbls_all[mode_idx], cmap="inferno",
-                                           extent=[0, os_val * pix_um, os_val * pix_um, 0])
-                    ax_lbl.set_title(f"Mode {mode_idx + 1}  Label\n"
-                                     f"out_size={os_val} px  |  {pix_um:.1f} um/px"
-                                     f"  |  {os_val * pix_um:.0f} x {os_val * pix_um:.0f} um")
-                    fig.colorbar(im_lbl, ax=ax_lbl, fraction=0.046, pad=0.04)
-
-                    fig.tight_layout()
-                    st.pyplot(fig)
-                    plt.close(fig)
-            except Exception as exc:
-                st.caption(f"(mode preview unavailable: {exc})")
 
 
 # ---------------------------------------------------------------------------
@@ -392,6 +271,11 @@ def _do_start_training() -> None:
     cfg      = st.session_state.wl_train_config
     mat_path = st.session_state.mat_file_path
     assert mat_path, "Start button must be disabled when no .mat file is loaded"
+
+    # Save config before training so the current mat_file_path is persisted
+    cfg["mat_file_path"] = mat_path
+    ConfigManager(CONFIG_PATH).save_config(cfg)
+    st.session_state.wl_config_mtime = CONFIG_PATH.stat().st_mtime
 
     st.session_state.training_error = None
     adapter = _get_adapter()

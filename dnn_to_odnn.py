@@ -41,7 +41,7 @@ def main() -> None:
     amplitude_ref_norm = amplitude_ref
 
     # === 加载模场并生成输入光场 ===
-    eigenmodes = load_complex_modes_from_mat(mat_path, key="modes_field")
+    eigenmodes, _ = load_complex_modes_from_mat(mat_path, key="modes_field")
     mmf_modes = eigenmodes[:, :, :num_modes].transpose(2, 0, 1).astype(np.complex64)
     #plot_modes_amp_phase(mmf_modes, output_dir / "mmf_modes_amp_phase.png")
     field_complex = np.tensordot(complex_weights_ref, mmf_modes, axes=(0, 0))

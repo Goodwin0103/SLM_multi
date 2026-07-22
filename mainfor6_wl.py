@@ -137,6 +137,7 @@ margin_ratio = 0.2
 # train hyperparams
 epochs = 1000
 lr = 1.99
+lr_gamma = 0.99
 padding_ratio = 0.5
 
 # prediction viz samples
@@ -167,6 +168,7 @@ if _cfg:
     batch_size            = int(_cfg.get("batch_size",            batch_size))
     epochs                = int(_cfg.get("epochs",                epochs))
     lr                    = float(_cfg.get("lr",                  lr))
+    lr_gamma              = float(_cfg.get("lr_gamma",            lr_gamma))
     padding_ratio         = float(_cfg.get("padding_ratio",       padding_ratio))
     z_layers              = float(_cfg.get("z_layers_um",         z_layers * 1e6))   * 1e-6
     z_prop                = float(_cfg.get("z_prop_um",           z_prop * 1e6))     * 1e-6
@@ -184,6 +186,8 @@ if _cfg:
     label_pattern_mode    = str(_cfg.get("label_pattern_mode",    label_pattern_mode))
     circle_focus_radius   = int(_cfg.get("circle_focus_radius",   circle_focus_radius))
     margin_ratio          = float(_cfg.get("margin_ratio",        margin_ratio))
+    circle_detectsize     = int(_cfg.get("circle_detectsize",   circle_detectsize))
+    label_config          = _cfg.get("label_config", None)  # New: from Dataset & Label Designer
     num_layers_list_cfg   = _cfg.get("num_layers_list", num_layer_option)
     if isinstance(num_layers_list_cfg, list):
         num_layer_option = [int(x) for x in num_layers_list_cfg]
@@ -408,6 +412,90 @@ def region_energy_fractions(
     out = out / (out.sum(dim=1, keepdim=True) + 1e-12)
     return out
 
+
+@torch.no_grad()
+def evaluate_group_isolation_db(
+    model: D2NNModelMultiWL,
+    mode_groups: list[list[int]],
+    evaluation_regions: list[tuple[int, int, int, int]],
+    detect_radius: int,
+    *,
+    num_modes: int,
+    num_wavelengths: int,
+    wavelengths_m: np.ndarray,
+    mmf_modes: torch.Tensor,
+    layer_size: int,
+    device: torch.device,
+) -> dict:
+    """Group-level isolation for mode-group labels.
+
+    Each (group, wavelength) pair has one ROI. Mode energy is aggregated
+    per ROI, and group isolation = 10*log10(E_target / sum(E_other_groups)).
+
+    Returns dict with:
+      - per_mode_per_wl_db: (M, L) array
+      - mean_db: scalar
+      - group_crosstalk_matrix: (L, G, G) per-wavelength
+      - mode_groups: the input grouping
+    """
+    model.eval()
+    M = num_modes
+    L = num_wavelengths
+    G = len(mode_groups)
+
+    mode_to_group = {m: g for g, modes in enumerate(mode_groups) for m in modes}
+
+    # representative mode per group (first one)
+    rep_mode_per_group = [g[0] for g in mode_groups]
+    group_regions_per_wl: list[list[tuple[int, int, int, int]]] = []
+    for wl_idx in range(L):
+        regs = []
+        for g_idx in range(G):
+            m_rep = rep_mode_per_group[g_idx]
+            regs.append(evaluation_regions[m_rep * L + wl_idx])
+        group_regions_per_wl.append(regs)
+
+    per_mode_per_wl_db = np.zeros((M, L), dtype=np.float64)
+    energy_mlg = np.zeros((M, L, G), dtype=np.float64)
+
+    for m_idx in range(M):
+        mode_field = mmf_modes[m_idx].to(device=device, dtype=torch.complex64)
+        padded = pad_field_to_layer(mode_field, layer_size)
+        x = padded[None, None, ...].repeat(1, L, 1, 1).contiguous()
+        I_pred = model(x)
+        I_pred = I_pred[0].to(torch.float32)
+
+        for wl_idx in range(L):
+            I_hw = I_pred[wl_idx]
+            for g_idx in range(G):
+                x0, x1, y0, y1 = group_regions_per_wl[wl_idx][g_idx]
+                patch = I_hw[y0:y1, x0:x1]
+                hh, ww = patch.shape
+                cmask = _make_circle_mask_local(hh, ww, float(detect_radius), device=I_hw.device)
+                energy_mlg[m_idx, wl_idx, g_idx] = float((patch * cmask).sum().item())
+
+            target_g = mode_to_group[m_idx]
+            E_t = energy_mlg[m_idx, wl_idx, target_g]
+            E_o = energy_mlg[m_idx, wl_idx, :].sum() - E_t
+            per_mode_per_wl_db[m_idx, wl_idx] = 10.0 * np.log10(max(E_t, 1e-12) / max(E_o, 1e-12))
+
+    # group crosstalk matrix per wavelength
+    group_crosstalk = np.zeros((L, G, G), dtype=np.float64)
+    for wl_idx in range(L):
+        for src_g in range(G):
+            src_modes = mode_groups[src_g]
+            row = energy_mlg[src_modes, wl_idx, :].sum(axis=0)
+            group_crosstalk[wl_idx, src_g, :] = row / (row.sum() + 1e-12)
+
+    return {
+        "per_mode_per_wl_db": per_mode_per_wl_db,
+        "mean_db": float(np.mean(per_mode_per_wl_db)),
+        "energy_mlg": energy_mlg,
+        "group_crosstalk_matrix": group_crosstalk,
+        "mode_groups": mode_groups,
+    }
+
+
 @torch.no_grad()
 def save_prediction_diagnostics_multiwl(
     model: D2NNModelMultiWL,
@@ -582,7 +670,7 @@ def build_mode_context(base_modes: np.ndarray, num_modes: int) -> dict:
 # Load eigenmodes
 # ============================================================
 _mat_path = _cli.mat_file if _cli.mat_file else "mmf_10modes_GRIN_176_PD1.2.mat"
-eigenmodes_OM4 = load_complex_modes_from_mat(_mat_path, key="modes_field")
+eigenmodes_OM4, _mode_info = load_complex_modes_from_mat(_mat_path, key="modes_field")
 print("Loaded modes shape:", eigenmodes_OM4.shape, "dtype:", eigenmodes_OM4.dtype)
 
 mode_context = build_mode_context(eigenmodes_OM4, num_modes)
@@ -597,18 +685,47 @@ base_phases = mode_context["base_phases"]
 # ============================================================
 print(f"\n{'=' * 60}")
 print(f"Generating MultiWL Labels: {num_modes} modes × {L} wavelengths = {num_modes * L} labels")
+if label_config:
+    print(f"  label_type:  {label_config.get('label_type', 'modes')}")
+    print(f"  label_shape: {label_config.get('label_shape', 'circle')}")
 print(f"{'=' * 60}")
 
-mmf_label_patterns, evaluation_regions = generate_detector_patterns_multiwl(
-    H=out_size,
-    W=out_size,
-    num_modes=num_modes,
-    num_wavelengths=L,
-    radius=circle_focus_radius,
-    pattern_mode=label_pattern_mode,
-    show_debug=show_detection_overlap_debug,
-    margin_ratio=margin_ratio,
-)
+if label_config:
+    # Use centralized label designer
+    from label_designer import generate_labels
+    try:
+        mmf_label_patterns, evaluation_regions, _per_label_radii = generate_labels(
+            out_size=out_size,
+            num_modes=num_modes,
+            num_wavelengths=L,
+            label_config=label_config,
+            modes_field=eigenmodes_OM4,
+            mode_info=_mode_info,
+            show_debug=show_detection_overlap_debug,
+            debug_save_path=str(RUN_ROOT / "debug_multiwl_labels.png"),
+        )
+        print(f"✔ Generated {len(evaluation_regions)} evaluation regions (via label_designer)")
+    except Exception as e:
+        print(f"[WARN] label_designer failed ({e}), falling back to circle mode")
+        label_config = None  # fall through to default
+
+if not label_config:
+    # Fallback: use inline function (backward compat). Only "circle" is supported here;
+    # other shapes require label_designer via label_config.
+    _pmode = label_pattern_mode if label_pattern_mode == "circle" else "circle"
+    if label_pattern_mode != "circle":
+        print(f"[WARN] label_pattern_mode='{label_pattern_mode}' not supported without label_config, "
+              f"falling back to 'circle'. Use Dataset & Label Designer to enable custom shapes.")
+    mmf_label_patterns, evaluation_regions = generate_detector_patterns_multiwl(
+        H=out_size,
+        W=out_size,
+        num_modes=num_modes,
+        num_wavelengths=L,
+        radius=circle_focus_radius,
+        pattern_mode=_pmode,
+        show_debug=show_detection_overlap_debug,
+        margin_ratio=margin_ratio,
+    )
 
 MMF_Label_data = torch.from_numpy(mmf_label_patterns).to(torch.float32)
 print(f"✔ Generated {len(evaluation_regions)} evaluation regions")
@@ -813,7 +930,7 @@ for num_layer in num_layer_option:
         lr=lr,
         device=device,
         seed=SEED,
-        scheduler_gamma=0.99,
+        scheduler_gamma=lr_gamma,
         stage_ratios=[0.25, 0.25, 0.25, 0.25],
         verbose=True,
         num_layer=num_layer,
@@ -871,6 +988,7 @@ for num_layer in num_layer_option:
             "phase_option": int(phase_option),
             "circle_detectsize": int(circle_detectsize),
             "total_training_time_sec": float(total_time),
+            **({"label_config": label_config} if label_config else {}),
         },
     )
     print("✔ Checkpoint saved ->", ckpt_path)
@@ -975,6 +1093,34 @@ for num_layer in num_layer_option:
         f"WL Iso={comp_metrics['wavelength_isolation_db_mean']:.2f} dB, "
         f"IL={comp_metrics['insertion_loss_db_mean']:.2f} dB"
     )
+
+    # ============================================================
+    # Group Isolation (mode_groups label)
+    # ============================================================
+    if label_config and label_config.get("label_type") == "mode_groups":
+        from label_designer import _groups_from_mode_info as _gfi
+        _mg = label_config.get("mode_groups")
+        if _mg is None and _mode_info is not None:
+            _mg = _gfi(_mode_info, num_modes)
+        if _mg:
+            print(f"\n--- Group Isolation ({len(_mg)} groups) ---")
+            group_metrics = evaluate_group_isolation_db(
+                model=model,
+                mode_groups=_mg,
+                evaluation_regions=evaluation_regions,
+                detect_radius=detect_radius_eval,
+                num_modes=num_modes,
+                num_wavelengths=L,
+                wavelengths_m=wavelengths,
+                mmf_modes=MMF_data_ts,
+                layer_size=layer_size,
+                device=device,
+            )
+            comprehensive_metrics_per_layer[int(num_layer)]["group_isolation"] = group_metrics
+            print(f"  Mean Group Isolation: {group_metrics['mean_db']:.2f} dB")
+            for wl_idx in range(L):
+                print(f"  λ={wavelengths[wl_idx]*1e9:.1f} nm: "
+                      f"{10*np.log10(np.clip(np.diag(group_metrics['group_crosstalk_matrix'][wl_idx]), 1e-6, None))}")
 
     # 每层追加写一行JSON，供 batch_train_wl.py 收集
     try:

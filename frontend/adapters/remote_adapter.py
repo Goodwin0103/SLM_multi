@@ -195,6 +195,9 @@ class RemoteAdapter(BaseODNNAdapter):
             mat_name = Path(mat_file).name
             self._scp_upload(mat_file, f"{self._remote_upload_dir}/{mat_name}")
             remote_mat_path = f"{self._remote_upload_dir}/{mat_name}"
+            # Persist paths back to config so Save Config / next session picks them up
+            config["mat_file_path"] = str(Path(mat_file))
+            config["mat_file_remote_path"] = remote_mat_path
         else:
             remote_mat_path = mat_file
 
@@ -409,6 +412,110 @@ class RemoteAdapter(BaseODNNAdapter):
             except (ValueError, IndexError):
                 continue
         return gpus
+
+    # ------------------------------------------------------------------
+    # MATLAB generation
+    # ------------------------------------------------------------------
+
+    def run_matlab_generation(
+        self, matlab_script: str, remote_dir: str = "~/matlab_gen"
+    ) -> Dict[str, Any]:
+        """Execute a MATLAB script on the remote server.
+
+        Parameters
+        ----------
+        matlab_script:
+            Full MATLAB script content as a string.
+        remote_dir:
+            Directory on the server to stage the script and log files.
+
+        Returns
+        -------
+        dict with keys: ``pid``, ``log_path``, ``remote_dir``
+        """
+        import base64
+
+        # Ensure remote directory exists
+        self._ssh(f"mkdir -p {remote_dir}")
+
+        # Upload the script via base64 pipe
+        encoded = base64.b64encode(matlab_script.encode()).decode()
+        self._ssh(
+            f"echo '{encoded}' | base64 -d > {remote_dir}/gen_script.m",
+            timeout=15,
+        )
+
+        log_path = f"{remote_dir}/gen.log"
+
+        # Launch MATLAB in background with nohup
+        result = self._ssh(
+            f"cd {remote_dir} && "
+            f"nohup matlab -nodisplay -nosplash -nodesktop "
+            f"-r \"gen_script; exit\" > {log_path} 2>&1 & echo PID:$!",
+            timeout=30,
+        )
+
+        pid_str = ""
+        for line in result.stdout.splitlines():
+            if "PID:" in line:
+                pid_str = line.split("PID:")[-1].strip()
+                break
+
+        return {
+            "pid": pid_str,
+            "log_path": log_path,
+            "remote_dir": remote_dir,
+        }
+
+    def tail_remote_log(self, log_path: str, n: int = 50) -> List[str]:
+        """Return the last *n* lines of a remote log file."""
+        try:
+            result = self._ssh(f"tail -n {n} {log_path}", timeout=15)
+            return result.stdout.splitlines()
+        except Exception:
+            return []
+
+    def is_matlab_alive(self, remote_pid: str) -> bool:
+        """Check whether a MATLAB process on the server is still running."""
+        try:
+            result = self._ssh(
+                f"ps -p {remote_pid} > /dev/null && echo ALIVE || echo DEAD",
+                timeout=10,
+            )
+            return "ALIVE" in result.stdout
+        except Exception:
+            return False
+
+    def download_file(self, remote_path: str, local_dir: str) -> str:
+        """Download a file from the server via SCP.
+
+        Returns the local path of the downloaded file.
+        """
+        import subprocess
+        local_dir_path = Path(local_dir)
+        local_dir_path.mkdir(parents=True, exist_ok=True)
+        local_path = local_dir_path / Path(remote_path).name
+
+        cmd = [
+            "scp", "-P", str(self.port),
+            "-o", "ConnectTimeout=30",
+            "-o", "StrictHostKeyChecking=accept-new",
+            f"{self.ssh_target}:{remote_path}",
+            str(local_path),
+        ]
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=120)
+        return str(local_path)
+
+    def list_remote_mat_files(self, subdir: str = "") -> List[str]:
+        """List .mat files in the workspace uploads directory (or *subdir*)."""
+        target = f"{self._remote_upload_dir}/{subdir}".rstrip("/")
+        try:
+            result = self._ssh(
+                f"find {target} -name '*.mat' -type f 2>/dev/null", timeout=15,
+            )
+            return [p for p in result.stdout.splitlines() if p.strip()]
+        except Exception:
+            return []
 
     # ------------------------------------------------------------------
     # run_test — not implemented for remote (testing is local-only)

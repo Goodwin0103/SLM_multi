@@ -227,6 +227,20 @@ def _render_model_section(adapter: Mainfor6WLAdapter) -> None:
 
     # -- .mat file ---------------------------------------------------------
     st.markdown("**Mode file (.mat)**")
+    # Auto-fill from designer config if available
+    if not st.session_state.wl_mat_file:
+        designer_config_path = _FRONTEND_DIR / "temp" / "dataset_label_config.json"
+        if designer_config_path.exists():
+            try:
+                import json
+                with open(designer_config_path) as f:
+                    designer = json.load(f)
+                mat_path_designer = designer.get("mat_file_path")
+                if mat_path_designer and Path(mat_path_designer).exists():
+                    st.session_state.wl_mat_file = mat_path_designer
+                    st.info(f"Using dataset from Designer: **{Path(mat_path_designer).name}**")
+            except Exception:
+                pass
     default_mat = st.session_state.get("mat_file_path") or ""
     mat_path = st.text_input(
         "Path to .mat file",
