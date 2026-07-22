@@ -19,6 +19,8 @@ venv/
 # Old worktree reference (already removed)
 .git
 
+CLAUDE.md
+
 # Frontend temp / cache
 frontend/temp/
 frontend/logs/
