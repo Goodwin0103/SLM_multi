@@ -121,7 +121,7 @@ mkdir -p ~/odnn_workspace/{uploads,runs}
 
 ## 2.5 MATLAB 数据集生成
 
-如果需要在服务器上用 MATLAB 生成新的 .mat 模式数据集，需要把整个整个eigenmodes_generation_grin目录放到服务器根目录下。
+如果需要在服务器上用 MATLAB 生成新的 .mat 模式数据集，需要把整个整个eigenmodes_generation_grin目录放到服务器根目录下(eigenmodes_generation_grin目录，可在项目目录下，下载然后解压)。
 在本地电脑终端:
 
 ```bash
