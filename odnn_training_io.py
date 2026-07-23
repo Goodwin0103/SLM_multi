@@ -156,8 +156,10 @@ def train_multiwl_staged(
     scheduler_gamma: float = 0.99,
     stage_ratios: Optional[List[float]] = None,
     verbose: bool = True,
-    num_layer: int = 1,
-    total_layers: int = 1,
+    pass_index: int = 1,
+    total_passes: int = 1,
+    num_layers_in_model: int = 1,
+    global_t_start: float = 0.0,
     metrics_path: str = "",
 ) -> Dict[str, any]:
     """
@@ -288,12 +290,26 @@ def train_multiwl_staged(
         epoch_durations.append(epoch_duration)
         
         # write metrics JSONL for frontend monitoring (every epoch)
-        _t_elapsed = time.time() - t_start
-        _etr = (_t_elapsed / epoch) * (epochs - epoch) if epoch > 0 else 0.0
+        _t_elapsed_local = time.time() - t_start
+        _t_elapsed = time.time() - (global_t_start if global_t_start > 0 else t_start)
         _cur_lr = optimizer.param_groups[0]['lr']
-        _overall_epoch = (num_layer - 1) * epochs + epoch
-        _overall_total = total_layers * epochs
-        _overall_etr = (_t_elapsed / epoch) * (_overall_total - _overall_epoch) if epoch > 0 else 0.0
+        _overall_epoch = (pass_index - 1) * epochs + epoch
+        _overall_total = total_passes * epochs
+
+        # Per-layer ETR: moving average of recent epoch durations (smoother)
+        _recent_n = min(10, len(epoch_durations))
+        if _recent_n > 0:
+            _recent_avg = sum(epoch_durations[-_recent_n:]) / _recent_n
+            _etr = _recent_avg * (epochs - epoch)
+        else:
+            _etr = 0.0
+
+        # Overall ETR: use global elapsed time for cross-pass accuracy
+        if _overall_epoch > 0:
+            _overall_etr = (_t_elapsed / _overall_epoch) * (_overall_total - _overall_epoch)
+        else:
+            _overall_etr = 0.0
+
         _metrics_path = Path(metrics_path) if metrics_path else (
             Path(__file__).resolve().parent / "frontend" / "logs" / "metrics_wl.jsonl"
         )
@@ -302,8 +318,9 @@ def train_multiwl_staged(
             _mf.write(json.dumps({
                 "epoch": epoch,
                 "epochs_total": epochs,
-                "layer": num_layer,
-                "total_layers": total_layers,
+                "layer": pass_index,
+                "total_layers": total_passes,
+                "num_layers_in_model": num_layers_in_model,
                 "overall_epoch": _overall_epoch,
                 "overall_epochs_total": _overall_total,
                 "loss": round(epoch_loss, 8),

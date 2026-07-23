@@ -1,5 +1,6 @@
 """Multi-WL Testing page: Model & Data -> Test Configuration -> Results."""
 
+import json
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,6 +45,34 @@ _TESTING_DEFAULTS: Dict[str, Any] = {
     "z_step_um":                     20.0,
 }
 
+_TEST_UI_STATE_PATH = _FRONTEND_DIR / "temp" / "testing_wl_ui_state.json"
+
+
+def _load_test_ui_state() -> dict:
+    """Load persisted UI state from disk (survives session resets)."""
+    if _TEST_UI_STATE_PATH.exists():
+        try:
+            return json.loads(_TEST_UI_STATE_PATH.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _save_test_ui_state(d: dict) -> None:
+    """Persist UI state to disk."""
+    _TEST_UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _TEST_UI_STATE_PATH.write_text(json.dumps(d))
+
+
+def _persist_test_state() -> None:
+    """Save current test-related state to disk for cross-navigation survival."""
+    _save_test_ui_state({
+        "ckpt_source": st.session_state.get("wl_ckpt_source", "Local"),
+        "selected_ckpt": st.session_state.get("wl_selected_ckpt", None),
+        "mat_file": st.session_state.get("wl_mat_file", ""),
+    })
+
+
 _WL_TEST_WIDGET_FIELDS = [
     "mode_index", "num_modes", "circle_detectsize", "z_step_um",
     "num_superposition_eval_samples", "superposition_eval_seed",
@@ -55,6 +84,7 @@ _WL_TEST_WIDGET_FIELDS = [
 # ---------------------------------------------------------------------------
 
 def _init_session_state(adapter: Mainfor6WLAdapter) -> None:
+    ui = _load_test_ui_state()
     if "wl_test_cfg" not in st.session_state:
         mgr = ConfigManager(_WL_TEST_CONFIG_PATH)
         saved = mgr.load_config()
@@ -69,11 +99,16 @@ def _init_session_state(adapter: Mainfor6WLAdapter) -> None:
     if "wl_test_result" not in st.session_state:
         st.session_state.wl_test_result = None
     if "wl_selected_ckpt" not in st.session_state:
-        st.session_state.wl_selected_ckpt = None
+        st.session_state.wl_selected_ckpt = ui.get("selected_ckpt", None)
     if "wl_ckpt_meta" not in st.session_state:
-        st.session_state.wl_ckpt_meta = {}
+        # Reload meta from the restored checkpoint path
+        _ckpt = st.session_state.wl_selected_ckpt
+        if _ckpt and Path(_ckpt).exists():
+            st.session_state.wl_ckpt_meta = adapter.load_checkpoint_meta(_ckpt)
+        else:
+            st.session_state.wl_ckpt_meta = {}
     if "wl_mat_file" not in st.session_state:
-        st.session_state.wl_mat_file = ""
+        st.session_state.wl_mat_file = ui.get("mat_file", "")
     if "wl_test_error" not in st.session_state:
         st.session_state.wl_test_error = None
 
@@ -87,11 +122,13 @@ def _render_model_section(adapter: Mainfor6WLAdapter) -> None:
 
     # -- checkpoint source toggle -------------------------------------------
     if "wl_ckpt_source" not in st.session_state:
-        st.session_state.wl_ckpt_source = "Local"
+        st.session_state.wl_ckpt_source = _load_test_ui_state().get("ckpt_source", "Local")
 
     st.segmented_control(
         "Checkpoint source", options=["Local", "Remote"],
+        default=st.session_state.wl_ckpt_source,
         key="wl_ckpt_source",
+        on_change=_persist_test_state,
     )
     ckpt_source = st.session_state.wl_ckpt_source
 
@@ -125,6 +162,7 @@ def _render_model_section(adapter: Mainfor6WLAdapter) -> None:
                             st.session_state.wl_selected_ckpt = local_pth
                             st.session_state.wl_ckpt_meta = adapter.load_checkpoint_meta(local_pth)
                             st.session_state.wl_test_result = None
+                            _persist_test_state()
                             st.success(f"Downloaded: {local_pth}")
                             st.rerun()
                 else:
@@ -159,6 +197,7 @@ def _render_model_section(adapter: Mainfor6WLAdapter) -> None:
                 st.session_state.wl_selected_ckpt = chosen_path
                 st.session_state.wl_ckpt_meta = adapter.load_checkpoint_meta(chosen_path)
                 st.session_state.wl_test_result = None
+                _persist_test_state()
 
         # manual path fallback
         manual_ckpt = st.text_input(
@@ -172,6 +211,7 @@ def _render_model_section(adapter: Mainfor6WLAdapter) -> None:
                     st.session_state.wl_selected_ckpt = str(mp)
                     st.session_state.wl_ckpt_meta = adapter.load_checkpoint_meta(str(mp))
                     st.session_state.wl_test_result = None
+                    _persist_test_state()
                     st.rerun()
             elif mp.suffix != ".pth":
                 st.caption("Must be a .pth file.")
@@ -242,12 +282,15 @@ def _render_model_section(adapter: Mainfor6WLAdapter) -> None:
             except Exception:
                 pass
     default_mat = st.session_state.get("mat_file_path") or ""
+    _prev_mat = st.session_state.wl_mat_file
     mat_path = st.text_input(
         "Path to .mat file",
         value=st.session_state.wl_mat_file or default_mat,
         placeholder="/path/to/your/mmf_file.mat",
     )
     st.session_state.wl_mat_file = mat_path.strip()
+    if st.session_state.wl_mat_file != _prev_mat:
+        _persist_test_state()
 
     if st.session_state.wl_mat_file and not Path(st.session_state.wl_mat_file).exists():
         st.warning("File not found at the given path.")

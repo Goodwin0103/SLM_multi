@@ -32,6 +32,8 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 TRAIN_CONFIG_PATH = TEMP_DIR / "train_config_wl.json"
 
+_DESIGNER_UI_STATE_PATH = TEMP_DIR / "designer_ui_state.json"
+
 SHAPE_OPTIONS = ["circle", "square", "diamond", "plus", "ring", "larger_circle", "small_circle"]
 
 
@@ -39,7 +41,22 @@ SHAPE_OPTIONS = ["circle", "square", "diamond", "plus", "ring", "larger_circle",
 # Session state
 # =============================================================================
 
+def _load_designer_ui_state() -> dict:
+    """Load persisted UI state from disk (survives session resets)."""
+    if _DESIGNER_UI_STATE_PATH.exists():
+        try:
+            return json.loads(_DESIGNER_UI_STATE_PATH.read_text())
+        except Exception:
+            pass
+    return {}
+
+def _save_designer_ui_state(d: dict) -> None:
+    """Persist UI state to disk."""
+    _DESIGNER_UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _DESIGNER_UI_STATE_PATH.write_text(json.dumps(d))
+
 def _init_state() -> None:
+    disk = _load_designer_ui_state()
     defaults = {
         # dataset generation
         "dd_mat_file_path": None,
@@ -73,7 +90,7 @@ def _init_state() -> None:
         "dd_wavelength_um": 1.550,
         "dd_n_core": 1.45,
         "dd_pd_factor": 1.05,
-        "dd_basis": "LP",
+        "dd_basis": disk.get("dd_basis", "LP"),
         "dd_matlab_save_folder": "~/eigenmodes_generation_grin/mmf_data",
         "dd_matlab_toolbox_path": "~/eigenmodes_generation_grin",
     }
@@ -394,8 +411,15 @@ def _section_dataset_gen() -> None:
             "PD factor", value=st.session_state.dd_pd_factor, min_value=1.0, max_value=3.0, step=0.01,
             key="dd_w_pd",
         )
+        basis_options = ["LP", "LP_complex", "OAM"]
+        basis_idx = 0
+        # Restore from widget key first, fall back to logical key (disk-persisted)
+        _saved_basis = st.session_state.get("dd_w_basis") or st.session_state.get("dd_basis", "LP")
+        if _saved_basis in basis_options:
+            basis_idx = basis_options.index(_saved_basis)
         st.session_state.dd_basis = st.selectbox(
-            "Mode basis", options=["LP", "LP_complex", "OAM"], index=0, key="dd_w_basis",
+            "Mode basis", options=basis_options, index=basis_idx, key="dd_w_basis",
+            on_change=lambda: _save_designer_ui_state({"dd_basis": st.session_state.dd_w_basis}),
         )
     with col3:
         st.session_state.dd_matlab_save_folder = st.text_input(

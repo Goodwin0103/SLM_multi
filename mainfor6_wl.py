@@ -874,7 +874,9 @@ comprehensive_metrics_per_layer: dict[int, dict] = {}
 
 detect_radius_eval = int(detectsize // 2)
 
-for num_layer in num_layer_option:
+global_t_start = time.time()
+
+for pass_idx, num_layer in enumerate(num_layer_option, start=1):
     run_tag = datetime.now().strftime("%Y%m%d_%H%M%S")
     print(f"\n{'=' * 70}\nTraining D2NNModelMultiWL with {num_layer} layers\n{'=' * 70}")
 
@@ -933,8 +935,10 @@ for num_layer in num_layer_option:
         scheduler_gamma=lr_gamma,
         stage_ratios=[0.25, 0.25, 0.25, 0.25],
         verbose=True,
-        num_layer=num_layer,
-        total_layers=len(num_layer_option),
+        pass_index=pass_idx,
+        total_passes=len(num_layer_option),
+        num_layers_in_model=num_layer,
+        global_t_start=global_t_start,
         metrics_path=str(_METRICS_LOG),
     )
 

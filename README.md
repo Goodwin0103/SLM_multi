@@ -9,9 +9,24 @@ git clone -b Jinsong https://github.com/Goodwin0103/SLM_multi.git ODNN
 
 如果电脑上没装git，打开 [https://github.com/Goodwin0103/SLM_multi/tree/Jinsong](https://github.com/Goodwin0103/SLM_multi/tree/Jinsong) 下载ZIP后解压
 
-## 1.2 安装 Python 依赖
+## 1.2 创建本地Python虚拟环境
 
-在项目根目录下：
+创建: 
+```bash
+python3.11 -m venv ~/venv
+```
+激活: 
+```bash
+source ~/venv/bin/activate
+```
+如果要退出: 
+```bash
+deactivate
+```
+
+## 1.3 安装 Python 依赖
+
+在项目根目录下，激活虚拟环境：
 
 ```bash
 cd frontend
@@ -19,9 +34,10 @@ pip install -r requirements.txt
 
 ```
 
-如果本地电脑也想跑训练（Local 模式），还需要install mat73、h5py。
+如果本地电脑也想跑训练（Local 模式），可能还需要install h5py。
 
-## 1.3 启动前端
+
+## 1.4 启动前端
 
 在项目根目录下:
 
@@ -63,6 +79,11 @@ conda create -n odnn python=3.11 -y
 ```bash
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/main
 conda tos accept --override-channels --channel https://repo.anaconda.com/pkgs/r
+```
+然后再
+```bash
+conda create -n odnn python=3.11 -y
+
 ```
 
 激活虚拟环境

@@ -352,8 +352,25 @@ def _debug_plot(H, W, patterns, centers, eval_regions,
 
 
 def _groups_from_mode_info(mode_info, num_modes: int) -> list[list[int]]:
-    """Convert MATLAB mode_info struct array to mode_groups list."""
+    """Convert MATLAB mode_info struct array to mode_groups list.
+
+    Handles three formats produced by different .mat loaders:
+      - scipy loadmat (struct_as_record=False): ndarray of struct objects
+      - mat73 loadmat: dict of lists, e.g. {'group': [1, 1, 2, ...]}
+      - list of dicts (mat73 older versions)
+    """
     groups: dict[int, list[int]] = {}
+
+    # mat73 format: dict of lists (most common fallback path)
+    if isinstance(mode_info, dict) and 'group' in mode_info and not hasattr(mode_info, 'group'):
+        group_vals = mode_info['group']
+        if isinstance(group_vals, (list, np.ndarray)):
+            for m in range(num_modes):
+                g = int(group_vals[m]) if m < len(group_vals) else 0
+                groups.setdefault(g, []).append(m)
+            return [groups[g] for g in sorted(groups.keys())]
+
+    # scipy / list-of-dicts format
     for m in range(num_modes):
         try:
             if hasattr(mode_info, 'group'):

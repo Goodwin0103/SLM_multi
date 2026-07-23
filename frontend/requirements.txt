@@ -1,9 +1,14 @@
 streamlit>=1.35.0
 streamlit-autorefresh>=1.0.1
+altair>=5.0.0
 matplotlib>=3.7.0
 numpy>=1.24.0
 pandas>=2.0.0
+pillow>=10.0.0
 scipy>=1.10.0
+mat73>=0.60
 # torch is used in-process by the testing adapter (mainfor6_adapter.run_test);
 # install a version matching the training environment (cpu build is fine for inference)
 torch>=2.0.0
+
+#使用的Python版本是3.11。

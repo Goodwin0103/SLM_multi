@@ -1,6 +1,7 @@
 """Multi-WL Training page: Load Data -> Parameter Config -> Training."""
 
 import io
+import json
 import sys
 from pathlib import Path
 
@@ -34,6 +35,8 @@ REMOTE_METRICS_PATH = Path("/tmp/odnn_remote_metrics_wl.jsonl")
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+_UI_STATE_PATH = TEMP_DIR / "training_wl_ui_state.json"
+
 _PARAM_FIELDS = [
     "layer_size", "num_modes", "batch_size", "epochs",
     "learning_rate", "lr_gamma",
@@ -53,15 +56,39 @@ def _parse_int_list(text: str) -> list[int]:
     return result
 
 
+def _load_ui_state() -> dict:
+    """Load persisted UI state from disk (survives session resets)."""
+    if _UI_STATE_PATH.exists():
+        try:
+            return json.loads(_UI_STATE_PATH.read_text())
+        except Exception:
+            pass
+    return {}
+
+def _save_ui_state(d: dict) -> None:
+    """Persist UI state to disk."""
+    _UI_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    _UI_STATE_PATH.write_text(json.dumps(d))
+
+def _persist_training_state() -> None:
+    """Save current training-related state to disk for cross-navigation survival."""
+    _save_ui_state({
+        "compute_mode": st.session_state.get("wl_compute_mode", "Local"),
+        "is_training": st.session_state.get("is_training", False),
+        "remote_job_id": st.session_state.get("wl_remote_job_id", None),
+    })
+
+
 # ---------------------------------------------------------------------------
 # Session state init
 # ---------------------------------------------------------------------------
 
 def _init_state() -> None:
+    ui = _load_ui_state()
     if "wl_compute_mode" not in st.session_state:
-        st.session_state.wl_compute_mode = "Local"
+        st.session_state.wl_compute_mode = ui.get("compute_mode", "Local")
     if "wl_remote_job_id" not in st.session_state:
-        st.session_state.wl_remote_job_id = None
+        st.session_state.wl_remote_job_id = ui.get("remote_job_id", None)
     if "wl_remote_adapter" not in st.session_state:
         st.session_state.wl_remote_adapter = None
 
@@ -75,7 +102,7 @@ def _init_state() -> None:
     if "training_pid" not in st.session_state:
         st.session_state.training_pid = None
     if "is_training" not in st.session_state:
-        st.session_state.is_training = False
+        st.session_state.is_training = ui.get("is_training", False)
     if "training_error" not in st.session_state:
         st.session_state.training_error = None
 
@@ -301,6 +328,7 @@ def _do_start_training() -> None:
     else:
         st.session_state.training_pid = result
     st.session_state.is_training = True
+    _persist_training_state()
 
 
 def _do_stop_training() -> None:
@@ -319,6 +347,7 @@ def _do_stop_training() -> None:
         st.session_state.training_pid = None
 
     st.session_state.is_training = False
+    _persist_training_state()
 
 
 def _render_training_status() -> None:
@@ -399,6 +428,7 @@ def _section_training() -> None:
                     st.session_state.wl_remote_job_id = None
                 else:
                     st.session_state.training_pid = None
+                _persist_training_state()
 
     col_start, col_stop = st.columns([1, 1])
     with col_start:
@@ -435,6 +465,10 @@ def _section_training() -> None:
             st.caption("No metrics yet. Start training to see live data.")
         return
 
+    # Only show live metrics while training is active; avoid stale progress bar
+    if not st.session_state.is_training:
+        return
+
     # --- overall progress ---
     layer_now      = int(last.get("layer", 1))
     total_layers   = int(last.get("total_layers", 1))
@@ -456,7 +490,7 @@ def _section_training() -> None:
     m1.metric("Epoch (layer)",  f"{epoch_now}/{epochs_total}")
     m2.metric("Loss",           f"{last.get('loss', 0):.6f}")
     m3.metric("Elapsed",        fmt_seconds(last.get("elapsed_time", 0)))
-    m4.metric("Learning Rate",  f"{last.get('lr', 0):.2e}")
+    m4.metric("Learning Rate",  f"{last.get('lr', 0):.6g}")
     m5.metric("ETR (layer)",    fmt_seconds(last.get("etr", 0)))
     m6.metric("ETR (overall)",  fmt_seconds(last.get("overall_etr", 0)))
 
@@ -506,7 +540,9 @@ st.title("Multi-WL Training")
 
 st.segmented_control(
     "Compute", options=["Local", "Remote"],
+    default=st.session_state.wl_compute_mode,
     key="wl_compute_mode",
+    on_change=_persist_training_state,
 )
 
 st.divider()
