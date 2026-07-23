@@ -72,6 +72,7 @@ class Mainfor6WLAdapter(BaseODNNAdapter):
             "epochs": 1000,
             "learning_rate": 1.99,
             "lr_gamma": 0.99,
+            "lr_step_size": 1,
             "padding_ratio": 0.5,
             # evaluation
             "evaluation_mode": "eigenmode",

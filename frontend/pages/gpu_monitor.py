@@ -3,6 +3,10 @@
 Queries ``nvidia-smi`` over SSH every 5 seconds and displays utilisation,
 memory, and temperature for each GPU.  The GPU with the most free memory
 is highlighted as the recommended target for new training jobs.
+
+A manual GPU selector lets you pin training to a specific GPU.  When a GPU
+is manually selected, all subsequent remote training jobs will use that GPU.
+When set to "Auto", the adapter picks the GPU with the most free memory.
 """
 
 from __future__ import annotations
@@ -47,6 +51,77 @@ def _best_gpu(gpus: List[Dict[str, Any]]) -> int:
     return best["index"]
 
 
+def _build_gpu_options(gpus: List[Dict[str, Any]], best_idx: int) -> Dict[str, Any]:
+    """Build selectbox options mapping label -> gpu_id.
+
+    The first entry is always "Auto (Recommended)" which maps to ``None``.
+    """
+    options: Dict[str, Any] = {}
+    auto_label = f"Auto (Recommended — GPU {best_idx})" if best_idx >= 0 else "Auto (Recommended)"
+    options[auto_label] = None
+    for g in gpus:
+        mem_free_gb = g["memory_free_mib"] / 1024
+        label = f"GPU {g['index']} — {g['name']} ({mem_free_gb:.1f} GiB free)"
+        options[label] = g["index"]
+    return options
+
+
+def _gpu_selection_widget(gpus: List[Dict[str, Any]], best_idx: int) -> None:
+    """Render the manual GPU selector and store the choice in session state."""
+    options = _build_gpu_options(gpus, best_idx)
+
+    # Determine current index for the selectbox
+    current_value = st.session_state.get("manual_gpu_id")
+    option_values = list(options.values())
+    try:
+        current_index = option_values.index(current_value)
+    except (ValueError, IndexError):
+        current_index = 0  # default to Auto
+
+    selected_label = st.selectbox(
+        "Training GPU",
+        options=list(options.keys()),
+        index=current_index,
+        help=(
+            "Choose which GPU to use for training. "
+            "\"Auto\" picks the GPU with the most free memory. "
+            "Your selection persists across pages until changed."
+        ),
+        key="gpu_monitor_select",
+    )
+    selected_gpu_id = options[selected_label]
+    st.session_state.manual_gpu_id = selected_gpu_id
+
+    # Persist the selection to disk so it survives Streamlit session resets
+    _save_gpu_selection(selected_gpu_id)
+
+
+def _gpu_selection_path() -> Path:
+    """Path for persisting the manual GPU selection across sessions."""
+    return Path.home() / ".odnn" / "gpu_selection.json"
+
+
+def _load_gpu_selection() -> Any:
+    """Load persisted GPU selection, or None."""
+    path = _gpu_selection_path()
+    if path.exists():
+        try:
+            import json
+            data = json.loads(path.read_text())
+            return data.get("manual_gpu_id")
+        except Exception:
+            pass
+    return None
+
+
+def _save_gpu_selection(gpu_id: Any) -> None:
+    """Persist GPU selection to disk."""
+    import json
+    path = _gpu_selection_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"manual_gpu_id": gpu_id}))
+
+
 # ---------------------------------------------------------------------------
 # Page
 # ---------------------------------------------------------------------------
@@ -60,6 +135,10 @@ def render() -> None:
         st.warning("Remote server not configured.  Go to **Settings** first.")
         return
 
+    # Restore persisted GPU selection on first load
+    if "manual_gpu_id" not in st.session_state:
+        st.session_state.manual_gpu_id = _load_gpu_selection()
+
     # auto-refresh every 5 seconds
     st_autorefresh(interval=5000, key="gpu_monitor_refresh")
 
@@ -69,6 +148,11 @@ def render() -> None:
         return
 
     best_idx = _best_gpu(gpus)
+    manual_idx = st.session_state.get("manual_gpu_id")
+
+    # --- GPU selector -------------------------------------------------------
+    _gpu_selection_widget(gpus, best_idx)
+    st.divider()
 
     # summary row
     total_gpus = len(gpus)
@@ -84,19 +168,39 @@ def render() -> None:
 
     st.divider()
 
+    # Show current selection status
+    if manual_idx is not None:
+        st.info(f"Training will use **GPU {manual_idx}** (manual selection).")
+    else:
+        st.caption("Training will auto-select the GPU with the most free memory.")
+
+    st.divider()
+
     # per-GPU cards
     for gpu in gpus:
         idx = gpu["index"]
         is_best = idx == best_idx
+        is_selected = idx == manual_idx
 
-        border_color = "#27ae60" if is_best else "#cccccc"
-        bg_hint = "#f0fff0" if is_best else "transparent"
+        # Border: blue for manual selection, green for auto-recommended
+        if is_selected:
+            border_color = "#2980b9"
+        elif is_best:
+            border_color = "#27ae60"
+        else:
+            border_color = "#cccccc"
 
         with st.container(border=True):
             col_name, col_util, col_mem, col_temp = st.columns([2, 2, 2, 1])
 
             with col_name:
-                label = f"GPU {idx}  {'(Recommended)' if is_best else ''}"
+                # Build status label
+                tags = []
+                if is_selected:
+                    tags.append("Selected")
+                elif is_best:
+                    tags.append("Recommended")
+                label = f"GPU {idx}  ({', '.join(tags)})" if tags else f"GPU {idx}"
                 st.markdown(f"**{gpu['name']}**")
                 st.caption(label)
 
@@ -114,7 +218,6 @@ def render() -> None:
 
             with col_temp:
                 temp = gpu.get("temperature_gpu", 0)
-                temp_emoji = "cool" if temp < 50 else ("warm" if temp < 75 else "hot")
                 st.metric("Temp", f"{temp} C")
 
 

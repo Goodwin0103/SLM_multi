@@ -173,12 +173,21 @@ class RemoteAdapter(BaseODNNAdapter):
     # Training control
     # ------------------------------------------------------------------
 
-    def start_training(self, config: Dict[str, Any], mat_file: str = "") -> str:
-        """Upload config & data, auto-select GPU, launch training on server.
+    def start_training(
+        self, config: Dict[str, Any], mat_file: str = "",
+        gpu_id: Optional[int] = None,
+    ) -> str:
+        """Upload config & data, launch training on server.
 
         Writes a *launcher script* to the server so that the slow ``conda
         activate`` happens inside a background process.  The SSH call returns
         in under 10 seconds regardless of conda startup time.
+
+        Parameters
+        ----------
+        gpu_id:
+            Specific GPU index to use.  When ``None`` (default), the GPU with
+            the most free memory is selected automatically.
 
         Returns a ``job_id`` string: ``"user@host:run_id:remote_pid"``.
         """
@@ -201,8 +210,11 @@ class RemoteAdapter(BaseODNNAdapter):
         else:
             remote_mat_path = mat_file
 
-        # 3. Pick best GPU (separate SSH call, quick) ------------------------
-        gpu_id = self._pick_best_gpu()
+        # 3. Pick GPU (manual override or auto-select) -----------------------
+        if gpu_id is not None:
+            gpu_id = int(gpu_id)
+        else:
+            gpu_id = self._pick_best_gpu()
 
         # 4. Build config + launcher script (both base64) --------------------
         config_json = json.dumps(config, indent=2)

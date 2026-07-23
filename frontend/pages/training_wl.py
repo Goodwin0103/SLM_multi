@@ -39,7 +39,7 @@ _UI_STATE_PATH = TEMP_DIR / "training_wl_ui_state.json"
 
 _PARAM_FIELDS = [
     "layer_size", "num_modes", "batch_size", "epochs",
-    "learning_rate", "lr_gamma",
+    "learning_rate", "lr_gamma", "lr_step_size",
     "z_layers_um", "z_prop_um", "z_input_to_first_um", "pixel_size_um",
     "padding_ratio_out",
 ]
@@ -248,6 +248,7 @@ def _section_param_config() -> None:
         st.number_input("Batch size",   1,    256,  step=4,                        key="wl_param_batch_size")
         st.number_input("Learning rate", 0.01, 10.0, value=cfg.get("learning_rate", 1.99), format="%.4f", step=0.01, key="wl_param_learning_rate")
         st.number_input("LR gamma",      0.5,  1.0,  value=cfg.get("lr_gamma", 0.99),       format="%.3f", step=0.005, key="wl_param_lr_gamma")
+        st.number_input("LR step (epochs)", 1, 500, value=cfg.get("lr_step_size", 1),     step=1,   key="wl_param_lr_step_size")
 
         raw_phase = int(cfg.get("phase_option", 4))
         phase_idx = max(0, min(4, raw_phase - 1))
@@ -275,7 +276,7 @@ def _section_param_config() -> None:
         # Only persist known keys (strip garbage from old versions / other adapters)
         _ALL_KNOWN_KEYS = {
             "layer_size", "out_size", "num_modes", "batch_size", "epochs",
-            "learning_rate", "lr_gamma", "base_wavelength_idx", "phase_option",
+            "learning_rate", "lr_gamma", "lr_step_size", "base_wavelength_idx", "phase_option",
             "z_layers_um", "z_prop_um", "z_input_to_first_um", "pixel_size_um",
             "circle_focus_radius", "margin_ratio", "circle_detectsize",
             "wl_start_nm", "wl_spacing_nm", "wl_count", "padding_ratio_out",
@@ -318,7 +319,11 @@ def _do_start_training() -> None:
         METRICS_PATH.write_text("")
 
     try:
-        result = adapter.start_training(cfg, mat_file=mat_path)
+        if is_remote:
+            gpu_id = st.session_state.get("manual_gpu_id")
+            result = adapter.start_training(cfg, mat_file=mat_path, gpu_id=gpu_id)
+        else:
+            result = adapter.start_training(cfg, mat_file=mat_path)
     except Exception as exc:
         st.session_state.training_error = str(exc)
         return
@@ -338,12 +343,18 @@ def _do_stop_training() -> None:
     if is_remote:
         job_id = st.session_state.wl_remote_job_id
         if job_id and adapter:
-            adapter.stop_training(job_id)
+            try:
+                adapter.stop_training(job_id)
+            except Exception as exc:
+                st.session_state.training_error = f"Failed to stop remote training: {exc}"
         st.session_state.wl_remote_job_id = None
     else:
         pid = st.session_state.training_pid
         if pid:
-            adapter.stop_training(pid)
+            try:
+                adapter.stop_training(pid)
+            except Exception as exc:
+                st.session_state.training_error = f"Failed to stop local training: {exc}"
         st.session_state.training_pid = None
 
     st.session_state.is_training = False
@@ -355,7 +366,7 @@ def _render_training_status() -> None:
     is_remote = st.session_state.wl_compute_mode == "Remote"
 
     if st.session_state.training_error:
-        st.error(f"Failed to start training: {st.session_state.training_error}")
+        st.error(st.session_state.training_error)
         return
 
     if st.session_state.is_training:

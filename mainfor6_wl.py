@@ -138,6 +138,7 @@ margin_ratio = 0.2
 epochs = 1000
 lr = 1.99
 lr_gamma = 0.99
+lr_step_size = 1
 padding_ratio = 0.5
 
 # prediction viz samples
@@ -169,6 +170,7 @@ if _cfg:
     epochs                = int(_cfg.get("epochs",                epochs))
     lr                    = float(_cfg.get("lr",                  lr))
     lr_gamma              = float(_cfg.get("lr_gamma",            lr_gamma))
+    lr_step_size          = int(_cfg.get("lr_step_size",        lr_step_size))
     padding_ratio         = float(_cfg.get("padding_ratio",       padding_ratio))
     z_layers              = float(_cfg.get("z_layers_um",         z_layers * 1e6))   * 1e-6
     z_prop                = float(_cfg.get("z_prop_um",           z_prop * 1e6))     * 1e-6
@@ -933,6 +935,7 @@ for pass_idx, num_layer in enumerate(num_layer_option, start=1):
         device=device,
         seed=SEED,
         scheduler_gamma=lr_gamma,
+        scheduler_step_size=lr_step_size,
         stage_ratios=[0.25, 0.25, 0.25, 0.25],
         verbose=True,
         pass_index=pass_idx,

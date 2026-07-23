@@ -154,6 +154,7 @@ def train_multiwl_staged(
     device: torch.device,
     seed: int = 424242,
     scheduler_gamma: float = 0.99,
+    scheduler_step_size: int = 1,
     stage_ratios: Optional[List[float]] = None,
     verbose: bool = True,
     pass_index: int = 1,
@@ -206,7 +207,7 @@ def train_multiwl_staged(
         >>> print(f"Final loss: {result['final_loss']:.6f}")
     """
     import torch.optim as optim
-    from torch.optim.lr_scheduler import ExponentialLR
+    from torch.optim.lr_scheduler import StepLR
     from torch.utils.data import DataLoader
     
     L = len(wavelengths)
@@ -251,7 +252,7 @@ def train_multiwl_staged(
     
     # 优化器和调度器
     optimizer = optim.Adam(model.parameters(), lr=lr)
-    scheduler = ExponentialLR(optimizer, gamma=scheduler_gamma)
+    scheduler = StepLR(optimizer, step_size=scheduler_step_size, gamma=scheduler_gamma)
     
     # 训练历史
     losses: List[float] = []
